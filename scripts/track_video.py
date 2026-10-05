@@ -14,21 +14,26 @@ Examples:
     # Long video: sliding-window online model (constant memory)
     python scripts/track_video.py --video long.mp4 --mode online --grid_size 20
 
+    # OOM: split the points over 4 GPUs, at most 500 points per forward pass
+    python scripts/track_video.py --video v.mp4 --grid_size 60 --gpus 0,1,2,3 --chunk_size 500
+
 Outputs (in --out_dir/<video name>/):
     tracks.npy      float32 (T, N, 2)  pixel (x, y) per frame, original resolution
     visibility.npy  bool    (T, N)     whether each point is visible in each frame
-    queries.npy     float32 (N, 3)     (t, x, y) queries used (only for --queries)
+    queries.npy     float32 (N, 3)     (t, x, y) query point of each track
     tracks.mp4      visualization
 """
 
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import imageio.v3 as iio
 import numpy as np
 import torch
 from PIL import Image
 
+from cotracker.models.core.model_utils import get_points_on_a_grid
 from cotracker.predictor import CoTrackerOnlinePredictor, CoTrackerPredictor
 from cotracker.utils.visualizer import Visualizer
 
@@ -41,15 +46,26 @@ def load_video(path, max_frames, stride):
     return frames
 
 
-def run_offline(model, video, queries, mask, args):
-    return model(
-        video,
-        queries=queries,
-        segm_mask=mask,
-        grid_size=args.grid_size if queries is None else 0,
-        grid_query_frame=args.grid_query_frame,
-        backward_tracking=args.backward_tracking,
-    )
+def build_queries(args, T, H, W):
+    """All query points as a (N, 3) CPU tensor of (t, x, y) in original pixel coords."""
+    if args.queries:
+        q = np.loadtxt(args.queries, dtype=np.float32).reshape(-1, 3)
+        return torch.from_numpy(q)
+    # Same grid as CoTrackerPredictor: built at model resolution (384x512), then rescaled.
+    mh, mw = 384, 512
+    xy = get_points_on_a_grid(args.grid_size, (mh, mw))[0]  # (G*G, 2) row-major
+    xy = xy * torch.tensor([(W - 1) / (mw - 1), (H - 1) / (mh - 1)])
+    if args.mask:
+        m = np.array(Image.open(args.mask).convert("L").resize((W, H), Image.NEAREST)) > 0
+        ix = xy[:, 0].round().long().clamp(0, W - 1)
+        iy = xy[:, 1].round().long().clamp(0, H - 1)
+        xy = xy[torch.from_numpy(m)[iy, ix]]
+    t = torch.full((len(xy), 1), float(args.grid_query_frame))
+    return torch.cat([t, xy], dim=1)
+
+
+def run_offline(model, video, queries, args):
+    return model(video, queries=queries, backward_tracking=args.backward_tracking)
 
 
 def run_online(model, video, queries, args):
@@ -57,17 +73,30 @@ def run_online(model, video, queries, args):
     # The last (shorter) chunk is padded inside the model, so the tail is covered.
     T = video.shape[1]
     step = model.step
-    model(
-        video_chunk=video,
-        is_first_step=True,
-        queries=queries,
-        grid_size=args.grid_size,
-        grid_query_frame=args.grid_query_frame,
-    )
+    model(video_chunk=video, is_first_step=True, queries=queries)
     tracks = vis = None
     for ind in range(0, T - step, step):
         tracks, vis = model(video_chunk=video[:, ind : ind + step * 2])
     return tracks[:, :T], vis[:, :T]
+
+
+def gpu_worker(device, frames, chunks, ckpt, args):
+    """Track each chunk of queries on one device; returns [(chunk_idx, tracks, vis)]."""
+    if args.mode == "offline":
+        model = CoTrackerPredictor(checkpoint=ckpt, offline=True, window_len=60).to(device)
+        run = run_offline
+    else:
+        model = CoTrackerOnlinePredictor(checkpoint=ckpt, window_len=16).to(device)
+        run = run_online
+    video = torch.from_numpy(frames).to(device).permute(0, 3, 1, 2)[None].float()  # B T C H W
+    results = []
+    for idx, q in chunks:
+        tracks, vis = run(model, video, q[None].to(device), args)
+        results.append((idx, tracks[0].cpu(), vis[0].cpu()))
+        print(f"  [{device}] chunk {idx}: {len(q)} points done", flush=True)
+    del model, video
+    torch.cuda.empty_cache()
+    return results
 
 
 def main():
@@ -78,56 +107,66 @@ def main():
     p.add_argument("--grid_size", type=int, default=20, help="N x N grid of query points")
     p.add_argument("--grid_query_frame", type=int, default=0)
     p.add_argument("--queries", default=None, help='text file of "t x y" rows; overrides grid')
-    p.add_argument("--mask", default=None, help="binary mask image (offline + grid only)")
+    p.add_argument("--mask", default=None, help="binary mask image; keeps grid points inside it")
     p.add_argument("--backward_tracking", action="store_true", help="offline only")
     p.add_argument("--max_frames", type=int, default=0, help="0 = all frames")
     p.add_argument("--frame_stride", type=int, default=1)
+    p.add_argument("--gpus", default="all", help='"all" or comma list of visible GPU ids, e.g. 0,1')
+    p.add_argument(
+        "--chunk_size", type=int, default=0,
+        help="max points per forward pass (0 = split points evenly over GPUs). Lower it on OOM.",
+    )
     p.add_argument("--out_dir", default="./outputs")
     p.add_argument("--fps", type=int, default=10, help="visualization fps")
+    p.add_argument("--linewidth", type=int, default=2, help="circle radius = 2 * linewidth px")
     p.add_argument("--no_vis", action="store_true")
     args = p.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.mode == "online" and args.backward_tracking:
+        print("warning: --backward_tracking is ignored in online mode")
     ckpt = args.checkpoint or f"./checkpoints/scaled_{args.mode}.pth"
+    if not torch.cuda.is_available():
+        devices = ["cpu"]
+    elif args.gpus == "all":
+        devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+    else:
+        devices = [f"cuda:{i}" for i in args.gpus.split(",")]
 
     frames = load_video(args.video, args.max_frames, args.frame_stride)
     T, H, W, _ = frames.shape
-    print(f"video: {T} frames, {W}x{H}, device={device}, mode={args.mode}")
-    video = torch.from_numpy(frames).permute(0, 3, 1, 2)[None].float().to(device)  # B T C H W
+    queries = build_queries(args, T, H, W)
+    N = len(queries)
+    chunk_size = args.chunk_size or -(-N // len(devices))
+    chunks = list(enumerate(queries.split(chunk_size)))
+    print(
+        f"video: {T} frames, {W}x{H}, mode={args.mode}, {N} points in "
+        f"{len(chunks)} chunk(s) of <= {chunk_size} on {devices}"
+    )
 
-    queries = None
-    if args.queries:
-        q = np.loadtxt(args.queries, dtype=np.float32).reshape(-1, 3)
-        queries = torch.from_numpy(q)[None].to(device)  # B N 3 (t, x, y)
+    # Round-robin chunks over devices; one thread per device (CUDA work releases the GIL).
+    per_device = [chunks[i :: len(devices)] for i in range(len(devices))]
+    with ThreadPoolExecutor(len(devices)) as ex:
+        futures = [
+            ex.submit(gpu_worker, d, frames, c, ckpt, args)
+            for d, c in zip(devices, per_device) if c
+        ]
+        results = sorted(r for f in futures for r in f.result())
+    tracks = torch.cat([r[1] for r in results], dim=1)  # (T, N, 2)
+    vis = torch.cat([r[2] for r in results], dim=1)  # (T, N)
 
-    mask = None
-    if args.mask:
-        m = np.array(Image.open(args.mask).convert("L")) > 0
-        mask = torch.from_numpy(m).float()[None, None].to(device)  # B 1 H W
-
-    if args.mode == "offline":
-        model = CoTrackerPredictor(checkpoint=ckpt, offline=True, window_len=60).to(device)
-        tracks, vis = run_offline(model, video, queries, mask, args)
-    else:
-        if mask is not None or args.backward_tracking:
-            print("warning: --mask/--backward_tracking are ignored in online mode")
-        model = CoTrackerOnlinePredictor(checkpoint=ckpt, window_len=16).to(device)
-        tracks, vis = run_online(model, video, queries, args)
-
-    # tracks: (1, T, N, 2), vis: (1, T, N) bool
     name = os.path.splitext(os.path.basename(args.video))[0]
     out = os.path.join(args.out_dir, name)
     os.makedirs(out, exist_ok=True)
-    np.save(os.path.join(out, "tracks.npy"), tracks[0].cpu().numpy().astype(np.float32))
-    np.save(os.path.join(out, "visibility.npy"), vis[0].cpu().numpy().astype(bool))
-    if queries is not None:
-        np.save(os.path.join(out, "queries.npy"), queries[0].cpu().numpy())
-    print(f"tracks {tuple(tracks[0].shape)}, visible fraction {vis.float().mean():.2f} -> {out}")
+    np.save(os.path.join(out, "tracks.npy"), tracks.numpy().astype(np.float32))
+    np.save(os.path.join(out, "visibility.npy"), vis.numpy().astype(bool))
+    np.save(os.path.join(out, "queries.npy"), queries.numpy())
+    print(f"tracks {tuple(tracks.shape)}, visible fraction {vis.float().mean():.2f} -> {out}")
 
     if not args.no_vis:
         query_frame = 0 if args.backward_tracking else args.grid_query_frame
-        Visualizer(save_dir=out, pad_value=0, linewidth=2, fps=args.fps).visualize(
-            video.cpu(), tracks.cpu(), vis.cpu(), filename="tracks", query_frame=query_frame
+        video = torch.from_numpy(frames).permute(0, 3, 1, 2)[None].float()
+        Visualizer(save_dir=out, pad_value=0, linewidth=args.linewidth, fps=args.fps).visualize(
+            video, tracks[None], vis[None], filename="tracks", query_frame=query_frame
         )
 
 

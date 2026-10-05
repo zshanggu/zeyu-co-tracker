@@ -4,7 +4,7 @@
 #   docker/run.sh python scripts/track_video.py --video assets/apple.mp4
 #
 # Env vars:
-#   GPU=1          which GPU to expose (default: 0)
+#   GPU=1          GPUs to expose: one id, a list like 0,1,2,3, or all (default: 0)
 #   DATA=/path     extra host dir with your videos, mounted at /data (optional)
 set -euo pipefail
 
@@ -21,11 +21,17 @@ if [[ -n "${DATA:-}" ]]; then
     EXTRA+=(-v "$(realpath "$DATA")":/data)
 fi
 
+if [[ "$GPU" == all ]]; then
+    GPU_ARG=all
+else
+    GPU_ARG="\"device=$GPU\""  # docker needs the inner quotes for comma lists
+fi
+
 TTY=()
 [[ -t 0 ]] && TTY=(-it)
 
 exec docker run --rm "${TTY[@]}" \
-    --gpus "device=$GPU" \
+    --gpus "$GPU_ARG" \
     --shm-size=8g \
     --user "$(id -u):$(id -g)" \
     -e HOME=/tmp \
