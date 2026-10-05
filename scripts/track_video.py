@@ -24,10 +24,12 @@ Outputs (in --out_dir/<video name>/):
     tracks.npy      float32 (T, N, 2)  pixel (x, y) per frame, original resolution
     visibility.npy  bool    (T, N)     whether each point is visible in each frame
     queries.npy     float32 (N, 3)     (t, x, y) query point of each track
+    meta.json       video path, width, height, frames, frame_stride, fps
     tracks.mp4      visualization
 """
 
 import argparse
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 
@@ -137,7 +139,7 @@ def main():
         help="max points per forward pass (0 = split points evenly over GPUs). Lower it on OOM.",
     )
     p.add_argument("--out_dir", default="./outputs")
-    p.add_argument("--fps", type=int, default=10, help="visualization fps")
+    p.add_argument("--fps", type=float, default=None, help="visualization fps (default: source fps / stride)")
     p.add_argument("--radius", type=int, default=4, help="visualization dot radius in px (0 = 1 pixel)")
     p.add_argument("--no_vis", action="store_true")
     args = p.parse_args()
@@ -180,14 +182,24 @@ def main():
     np.save(os.path.join(out, "tracks.npy"), tracks.numpy().astype(np.float32))
     np.save(os.path.join(out, "visibility.npy"), vis.numpy().astype(bool))
     np.save(os.path.join(out, "queries.npy"), queries.numpy())
+    meta = dict(video=args.video, width=W, height=H, frames=T, frame_stride=args.frame_stride,
+                fps=iio.immeta(args.video, plugin="FFMPEG").get("fps"))
+    with open(os.path.join(out, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
     print(f"tracks {tuple(tracks.shape)}, visible fraction {vis.float().mean():.2f} -> {out}")
 
     if not args.no_vis:
         query_frame = 0 if args.backward_tracking else args.grid_query_frame
         video = torch.from_numpy(frames).permute(0, 3, 1, 2)[None].float()
-        Visualizer(save_dir=out, pad_value=0, point_radius=args.radius, fps=args.fps).visualize(
-            video, tracks[None], vis[None], filename="tracks", query_frame=query_frame
-        )
+        # show_first_frame=0 and our own writer: Visualizer.save_video otherwise repeats the
+        # first frame and drops frames ([2:-1]), so tracks.mp4 would not line up with the source.
+        res = Visualizer(pad_value=0, point_radius=args.radius, show_first_frame=0).visualize(
+            video, tracks[None], vis[None], query_frame=query_frame, save_video=False
+        )  # (1, T, 3, H, W) uint8
+        fps = args.fps or (meta["fps"] or 10 * args.frame_stride) / args.frame_stride
+        iio.imwrite(os.path.join(out, "tracks.mp4"), res[0].permute(0, 2, 3, 1).numpy(),
+                    fps=fps, plugin="FFMPEG")
+        print(f"saved {os.path.join(out, 'tracks.mp4')} ({T} frames, same as source)")
 
 
 if __name__ == "__main__":
