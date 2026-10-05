@@ -46,6 +46,8 @@ const TRACK_DEFAULTS = {
 };
 
 const COMPARE_FIELDS = [
+  { key: "direction", label: "Direction", type: "select", options: ["A vs B", "B vs A"],
+    help: "First video is the reference: dots are drawn on it, and the difference is first − second." },
   { key: "view", label: "View", type: "select", options: ["pairs", "diff"],
     help: "pairs: green = point has a visible pair in B, gray = no pair. diff: color by |A − B|." },
   { key: "metric", label: "Metric", type: "select", options: ["position", "displacement"] },
@@ -53,7 +55,7 @@ const COMPARE_FIELDS = [
   { key: "radius", label: "Dot radius (px)", type: "number", min: 0 },
   { key: "vmax", label: "Color max (px)", type: "number", min: 0, help: "diff view only; empty = 95th percentile." },
 ];
-const COMPARE_DEFAULTS = { view: "pairs", metric: "position", time: "truncate", radius: 2, vmax: "" };
+const COMPARE_DEFAULTS = { direction: "A vs B", view: "pairs", metric: "position", time: "truncate", radius: 2, vmax: "" };
 
 // ------------------------------------------------------------------ state
 
@@ -106,7 +108,7 @@ function makeBlock(row, col) {
     <div class="stage">
       <video muted playsinline preload="auto"></video>
       <div class="placeholder"><div>${isCompare
-        ? "Track A and B in this row, then press <b>Compare A vs B</b>.<br>Dots are drawn on video A."
+        ? "Track A and B in this row, then press <b>Compare</b>.<br>Use ⚙ to choose A vs B or B vs A."
         : "Press <b>Select video</b> to choose a source video."}</div></div>
       <pre class="status"></pre>
     </div>`;
@@ -142,7 +144,7 @@ function render(b) {
 
   const run = $('[data-act="run"]', b.el);
   run.disabled = running || (!b.isCompare && !b.src);
-  run.textContent = b.isCompare ? "Compare A vs B" : b.result ? "Re-track" : "Track";
+  run.textContent = b.isCompare ? `Compare ${b.params.direction}` : b.result ? "Re-track" : "Track";
   $('[data-act="cancel"]', b.el).hidden = !running;
   const toggle = $('[data-act="toggle"]', b.el);
   if (toggle) {
@@ -228,9 +230,10 @@ async function runJob(b) {
       return;
     }
     const p = b.params;
-    b.names = [A, B].map((x) => basename(x.src.path));
+    const [first, second] = p.direction === "B vs A" ? [B, A] : [A, B];  // first = reference, drawn on
+    b.names = [first, second].map((x) => basename(x.src.path));
     job = await postJSON("/api/compare", {
-      slot: b.id, a: A.result.dir, b: B.result.dir, view: p.view, metric: p.metric,
+      slot: b.id, a: first.result.dir, b: second.result.dir, view: p.view, metric: p.metric,
       time: p.time, radius: Number(p.radius), vmax: p.vmax === "" ? null : Number(p.vmax),
     });
   } else {
@@ -501,6 +504,7 @@ $("#params").addEventListener("close", async () => {
   const b = paramsTarget;
   if (!b) return;
   readParams(b);
+  render(b);
   if ($("#params").returnValue === "run") {
     try {
       await runJob(b);
