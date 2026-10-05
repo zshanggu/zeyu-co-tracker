@@ -20,7 +20,7 @@ Examples:
     # OOM: split the points over 4 GPUs, at most 500 points per forward pass
     python scripts/track_video.py --video v.mp4 --grid_size 60 --gpus 0,1,2,3 --chunk_size 500
 
-Outputs (in --out_dir/<video name>/):
+Outputs (in --out_dir/<video name>/, or exactly --save_dir if given):
     tracks.npy      float32 (T, N, 2)  pixel (x, y) per frame, original resolution
     visibility.npy  bool    (T, N)     whether each point is visible in each frame
     queries.npy     float32 (N, 3)     (t, x, y) query point of each track
@@ -139,6 +139,7 @@ def main():
         help="max points per forward pass (0 = split points evenly over GPUs). Lower it on OOM.",
     )
     p.add_argument("--out_dir", default="./outputs")
+    p.add_argument("--save_dir", default=None, help="write outputs exactly here (overrides --out_dir)")
     p.add_argument("--fps", type=float, default=None, help="visualization fps (default: source fps / stride)")
     p.add_argument("--radius", type=int, default=4, help="visualization dot radius in px (0 = 1 pixel)")
     p.add_argument("--no_vis", action="store_true")
@@ -177,7 +178,7 @@ def main():
     vis = torch.cat([r[2] for r in results], dim=1)  # (T, N)
 
     name = os.path.splitext(os.path.basename(args.video))[0]
-    out = os.path.join(args.out_dir, name)
+    out = args.save_dir or os.path.join(args.out_dir, name)
     os.makedirs(out, exist_ok=True)
     np.save(os.path.join(out, "tracks.npy"), tracks.numpy().astype(np.float32))
     np.save(os.path.join(out, "visibility.npy"), vis.numpy().astype(bool))

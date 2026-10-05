@@ -41,7 +41,7 @@ const TRACK_FIELDS = [
   { key: "mask", label: "Mask image", type: "mask", help: "Optional: keep only grid points inside the mask." },
 ];
 const TRACK_DEFAULTS = {
-  gpus: [0], mode: "offline", grid_size: "30", radius: 2, chunk_size: 0, frame_stride: 1,
+  gpus: [0], mode: "offline", grid_size: "100x50", radius: 2, chunk_size: 0, frame_stride: 1,
   max_frames: 0, grid_query_frame: 0, backward_tracking: false, mask: "",
 };
 

@@ -206,7 +206,7 @@ class TrackReq(BaseModel):
     video: str
     gpus: list[int] = [0]
     mode: str = "offline"
-    grid_size: str = "30"
+    grid_size: str = "100x50"
     radius: int = 2
     chunk_size: int = 0
     frame_stride: int = 1
@@ -227,11 +227,26 @@ class CompareReq(BaseModel):
     vmax: float | None = None
 
 
-def out_dir(slot: str) -> Path:
-    safe = "".join(c for c in slot if c.isalnum() or c in "-_") or "job"
-    d = GUI_OUT / f"{time.strftime('%Y%m%d-%H%M%S')}_{safe}_{uuid.uuid4().hex[:4]}"
-    d.mkdir(parents=True)
-    return d
+def out_dir(name: str) -> Path:
+    """outputs/gui/<name>, or <name>_2, <name>_3, ... if taken (never overwrite a shown result)."""
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name).strip(".") or "video"
+    GUI_OUT.mkdir(parents=True, exist_ok=True)
+    k = 1
+    while True:
+        d = GUI_OUT / (safe if k == 1 else f"{safe}_{k}")
+        try:
+            d.mkdir()  # atomic: two jobs can't claim the same folder
+            return d
+        except FileExistsError:
+            k += 1
+
+
+def video_stem(track_dir: Path) -> str:
+    """Source video name of a tracking result (from its meta.json)."""
+    try:
+        return Path(json.load(open(track_dir / "meta.json"))["video"]).stem
+    except (OSError, KeyError, ValueError):
+        return track_dir.name
 
 
 def start_job(kind: str, cmd: list[str], out: Path, result_dir: Path, result_video: Path):
@@ -268,8 +283,8 @@ def track(r: TrackReq):
         raise HTTPException(404, f"video not found: {r.video}")
     if r.mode not in {"offline", "online"}:
         raise HTTPException(400, "mode must be offline or online")
-    out = out_dir(r.slot)
-    cmd = [sys.executable, "scripts/track_video.py", "--video", rel(video), "--out_dir", rel(out),
+    out = out_dir(video.stem)
+    cmd = [sys.executable, "scripts/track_video.py", "--video", rel(video), "--save_dir", rel(out),
            "--mode", r.mode, "--grid_size", r.grid_size, "--radius", str(r.radius),
            "--chunk_size", str(r.chunk_size), "--frame_stride", str(r.frame_stride),
            "--max_frames", str(r.max_frames), "--grid_query_frame", str(r.grid_query_frame)]
@@ -279,8 +294,7 @@ def track(r: TrackReq):
         cmd.append("--backward_tracking")
     if r.mask:
         cmd += ["--mask", rel(resolve(r.mask))]
-    result = out / video.stem  # track_video.py writes <out_dir>/<video name>/
-    return start_job("track", cmd, out, result, result / "tracks.mp4")
+    return start_job("track", cmd, out, out, out / "tracks.mp4")
 
 
 @app.post("/api/compare")
@@ -289,7 +303,7 @@ def compare(r: CompareReq):
     for d in (a, b):
         if not (d / "tracks.npy").is_file():
             raise HTTPException(400, f"no tracking result in {rel(d)}")
-    out = out_dir(r.slot)
+    out = out_dir(f"{video_stem(a)}_vs_{video_stem(b)}")
     cmd = [sys.executable, "scripts/compare_tracks.py", "--a", rel(a), "--b", rel(b),
            "--out", rel(out), "--view", r.view, "--metric", r.metric, "--time", r.time,
            "--radius", str(r.radius)]
