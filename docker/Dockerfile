@@ -14,7 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir \
         "imageio[ffmpeg]" imageio-ffmpeg av \
         "matplotlib<3.9" flow_vis tqdm \
-        opencv-python-headless mediapy einops
+        opencv-python-headless mediapy einops \
+        fastapi "uvicorn[standard]" python-multipart
 
 # The repo itself is bind-mounted at /workspace at runtime (see docker/run.sh),
 # so code edits on the host are picked up without rebuilding.

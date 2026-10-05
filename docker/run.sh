@@ -6,6 +6,8 @@
 # Env vars:
 #   GPU=1          GPUs to expose: one id, a list like 0,1,2,3, or all (default: 0)
 #   DATA=/path     extra host dir with your videos, mounted at /data (optional)
+#   PORT=7860      publish this container port on the host's 127.0.0.1 (optional)
+#   MOUNTS="/a /b" host dirs mounted read-only at the same path inside (optional)
 set -euo pipefail
 
 IMAGE=cotracker3:latest
@@ -25,6 +27,15 @@ if [[ "$GPU" == all ]]; then
     GPU_ARG=all
 else
     GPU_ARG="\"device=$GPU\""  # docker needs the inner quotes for comma lists
+fi
+
+for m in ${MOUNTS:-}; do
+    [[ -d "$m" ]] && EXTRA+=(-v "$(realpath "$m")":"$(realpath "$m")":ro)
+done
+EXTRA+=(-e HOST_MOUNTS="${MOUNTS:-}")
+
+if [[ -n "${PORT:-}" ]]; then
+    EXTRA+=(-p "127.0.0.1:$PORT:$PORT")
 fi
 
 TTY=()

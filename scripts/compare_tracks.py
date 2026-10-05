@@ -4,22 +4,25 @@ Points are paired by their query position (same normalized (x, y) at the same qu
 both runs should use the same grid (e.g. both --grid_size 50). Resolutions may differ: B is
 rescaled to A's pixel space.
 
-Metrics (--metric):
-    displacement (default)  compare how far each point moved since its query frame:
-                            | (A[t] - A[q]) - (B[t] - B[q]) |  -- ignores a constant offset
-                            between the two videos (e.g. slightly different framing).
-    position                compare absolute positions: | A[t] - B[t] |
+Metrics (--metric), vector = A - B per point and frame:
+    position (default)      A[t] - B[t]: difference of absolute positions
+    displacement            (A[t] - A[q]) - (B[t] - B[q]): difference of movement since the
+                            query frame q. Identical to "position" when both runs start every
+                            point at the same pixel (same grid, same resolution).
 
 Example:
-    python scripts/compare_tracks.py --a outputs/run_A --b outputs/run_B --video A.mp4 --arrows
+    python scripts/compare_tracks.py --a outputs/run_A --b outputs/run_B --video A.mp4
 
 Outputs (in --out, default outputs/compare/<A>_vs_<B>/):
-    diff.npy        float32 (T, N)  per-point difference in A pixels, NaN where either is occluded
+    diff_vec.npy    float32 (T, N, 2) vector A - B (dx, dy) in A pixels, NaN where either is occluded
+    diff.npy        float32 (T, N)  its length |A - B|
     b_on_a.npy      float32 (T, N, 2) where B's point lands in A's pixel space
     pairs.npy       int     (N, 2)  matched point indices (index in A, index in B)
     per_frame.csv   frame, mean, median, p95, max, n_valid
     diff_over_time.png
-    compare.mp4     video A, dots colored by difference (+ arrows A -> B with --arrows)
+    paired.npy      bool    (T, N_A) A point has a B partner that is visible in both at frame t
+    compare.mp4     video A. --view pairs (default): green = paired at that frame, gray = no
+                    pair (no B partner, or hidden in A or B). --view diff: colored by |A - B|.
 """
 
 import argparse
@@ -115,15 +118,17 @@ def main():
     p.add_argument("--size_a", default=None, help="WxH of video A if A has no meta.json")
     p.add_argument("--size_b", default=None, help="WxH of video B if B has no meta.json")
     p.add_argument("--query_frame", type=int, default=0, help="for runs without queries.npy")
-    p.add_argument("--metric", choices=["displacement", "position"], default="displacement")
+    p.add_argument("--metric", choices=["position", "displacement"], default="position")
     p.add_argument(
         "--time", choices=["truncate", "resample"], default="truncate",
         help="different frame counts: cut to the shorter one, or stretch B to A's length",
     )
     p.add_argument("--match_tol", type=float, default=2e-3, help="normalized query distance")
     p.add_argument("--vmax", type=float, default=None, help="colormap max in px (default: p95)")
-    p.add_argument("--arrows", action="store_true", help="draw arrow from A's point to B's")
-    p.add_argument("--arrow_step", type=int, default=1, help="draw an arrow every k-th point")
+    p.add_argument(
+        "--view", choices=["pairs", "diff"], default="pairs",
+        help="pairs: highlight A points that have a B pair; diff: color by |A - B|",
+    )
     p.add_argument("--radius", type=int, default=2)
     p.add_argument("--fps", type=float, default=None, help="default: source fps / stride")
     p.add_argument("--out", default=None)
@@ -151,6 +156,7 @@ def main():
     if len(pairs) == 0:
         raise SystemExit("no matching query points; track both videos with the same grid")
     scale = (np.array(size_a) - 1) / (np.array(size_b) - 1)
+    A_all, visA_all = A, visA  # every A point, for drawing unpaired ones too
     A, visA, qA = A[:, pairs[:, 0]], visA[:, pairs[:, 0]], qA[pairs[:, 0]]
     B, visB = B[:, pairs[:, 1]] * scale, visB[:, pairs[:, 1]]
 
@@ -163,6 +169,7 @@ def main():
             print(f"frames differ (A {len(A)}, B {len(B)}): truncating to {T} (see --time)")
             A, visA, B, visB = A[:T], visA[:T], B[:T], visB[:T]
     T, N = A.shape[:2]
+    A_all, visA_all = A_all[:T], visA_all[:T]
 
     if args.metric == "displacement":
         tq = np.clip(qA[:, 0].astype(int), 0, T - 1)
@@ -171,15 +178,20 @@ def main():
     else:
         b_on_a = B
     valid = visA & visB
-    diff = np.linalg.norm(A - b_on_a, axis=-1)
-    diff[~valid] = np.nan
+    diff_vec = A - b_on_a  # (T, N, 2)
+    diff_vec[~valid] = np.nan
+    diff = np.linalg.norm(diff_vec, axis=-1)
+    paired = np.zeros(visA_all.shape, bool)  # (T, N_A)
+    paired[:, pairs[:, 0]] = valid
 
     name = lambda d: os.path.basename(os.path.normpath(d))
     out = args.out or os.path.join("outputs", "compare", f"{name(args.a)}_vs_{name(args.b)}")
     os.makedirs(out, exist_ok=True)
+    np.save(os.path.join(out, "diff_vec.npy"), diff_vec.astype(np.float32))
     np.save(os.path.join(out, "diff.npy"), diff.astype(np.float32))
     np.save(os.path.join(out, "b_on_a.npy"), b_on_a.astype(np.float32))
     np.save(os.path.join(out, "pairs.npy"), pairs)
+    np.save(os.path.join(out, "paired.npy"), paired)
 
     stats = []
     with open(os.path.join(out, "per_frame.csv"), "w", newline="") as f:
@@ -218,21 +230,25 @@ def main():
     fps = args.fps or src_fps / stride
 
     out_frames = []
+    green, gray = (0, 255, 0), (160, 160, 160)
     for t in range(T):
         fr = np.ascontiguousarray(frames[t])
-        for i in np.where(~valid[t])[0]:  # occluded in A or B: small gray ring
-            cv2.circle(fr, tuple(np.round(A[t, i]).astype(int)), args.radius, (160, 160, 160), 1)
-        order = np.where(valid[t])[0]
-        order = order[np.argsort(diff[t, order])]  # largest differences drawn on top
-        for i in order:
-            c = lut[int(np.clip(diff[t, i] / vmax, 0, 1) * 255)]
-            pa = tuple(np.round(A[t, i]).astype(int))
-            if args.arrows and i % args.arrow_step == 0:
-                pb = tuple(np.round(b_on_a[t, i]).astype(int))
-                cv2.arrowedLine(fr, pa, pb, c, 1, cv2.LINE_AA, tipLength=0.3)
-            cv2.circle(fr, pa, args.radius, c, -1, cv2.LINE_AA)
-        colorbar(fr, vmax, lut)
-        label = f"frame {t}  mean {stats[t, 0]:.2f}px"
+        if args.view == "pairs":
+            for i in np.where(~paired[t])[0]:
+                cv2.circle(fr, tuple(np.round(A_all[t, i]).astype(int)), args.radius, gray, -1, cv2.LINE_AA)
+            for i in np.where(paired[t])[0]:
+                cv2.circle(fr, tuple(np.round(A_all[t, i]).astype(int)), args.radius, green, -1, cv2.LINE_AA)
+            label = f"frame {t}  paired {paired[t].sum()}/{paired.shape[1]}"
+        else:
+            for i in np.where(~valid[t])[0]:  # occluded in A or B: small gray ring
+                cv2.circle(fr, tuple(np.round(A[t, i]).astype(int)), args.radius, gray, 1)
+            order = np.where(valid[t])[0]
+            order = order[np.argsort(diff[t, order])]  # largest differences drawn on top
+            for i in order:
+                c = lut[int(np.clip(diff[t, i] / vmax, 0, 1) * 255)]
+                cv2.circle(fr, tuple(np.round(A[t, i]).astype(int)), args.radius, c, -1, cv2.LINE_AA)
+            colorbar(fr, vmax, lut)
+            label = f"frame {t}  mean {stats[t, 0]:.2f}px"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
         cv2.rectangle(fr, (4, 4), (16 + tw, 14 + th), (0, 0, 0), -1)
         cv2.putText(fr, label, (10, 9 + th), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
