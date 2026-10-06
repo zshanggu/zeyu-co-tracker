@@ -167,6 +167,7 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.4); }
 #picker-list li:hover { background: var(--bg); }
 #picker-list li.empty { color: var(--muted); cursor: default; }
 #picker-list li.dir { font-weight: 600; }
+#picker-list li.result { color: var(--ok); }
 #picker-path { color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
 button.link { border: none; background: none; color: var(--accent); padding: 0; }
 button.link:hover { text-decoration: underline; }

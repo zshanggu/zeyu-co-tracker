@@ -23,6 +23,8 @@ function toast(msg) {
 }
 
 const basename = (p) => p.split("/").pop();
+// Name of the video behind a track block (source file, or the loaded result folder).
+const videoName = (b) => (b.src ? basename(b.src.path) : b.result ? b.result.label : "");
 
 // ------------------------------------------------------------------ parameters
 
@@ -135,7 +137,8 @@ function render(b) {
   }
   let name = meta ? basename(meta.path) : "";
   if (b.result && b.view === "result") {
-    name = b.isCompare ? `${b.result.names[0]} vs ${b.result.names[1]}` : `${basename(b.src.path)} (tracked)`;
+    name = b.isCompare ? `${b.result.names[0]} vs ${b.result.names[1]}`
+      : b.result.loaded ? `${b.result.label} (loaded result)` : `${videoName(b)} (tracked)`;
   }
   $(".name", b.el).textContent = name;
   $(".name", b.el).title = meta ? meta.path : "";
@@ -228,14 +231,20 @@ async function runJob(b) {
   if (b.isCompare) {
     const A = rowBlock(b.row, 0), B = rowBlock(b.row, 1);
     if (!A.result || !B.result) {
-      toast(`Track both A and B in ${ROW_NAMES[b.row]} first.`);
+      toast(`Track or load tracking results for both A and B in ${ROW_NAMES[b.row]} first.`);
       return;
     }
     const p = b.params;
     const [first, second] = p.direction === "B vs A" ? [B, A] : [A, B];  // first = reference, drawn on
-    b.names = [first, second].map((x) => basename(x.src.path));
+    b.names = [first, second].map(videoName);
+    if (first.result.loaded && !first.result.hasMeta && !first.src) {
+      toast(`${COL_NAMES[first.col]} (${first.result.label}) has no meta.json, so its source video is unknown. ` +
+            "It can only be the second video: switch Direction in ⚙.");
+      return;
+    }
     job = await postJSON("/api/compare", {
-      slot: b.id, a: first.result.dir, b: second.result.dir, view: p.view, metric: p.metric,
+      slot: b.id, a: first.result.dir, b: second.result.dir, video_a: first.src ? first.src.path : "",
+      view: p.view, metric: p.metric,
       time: p.time, radius: Number(p.radius), vmax: p.vmax === "" ? null : Number(p.vmax),
     });
   } else {
@@ -351,9 +360,14 @@ function drawPickerList() {
   };
   if (d.parent !== null) add("⬑ ..", "dir", () => browseTo(d.parent).catch((e) => toast(e.message)));
   const match = (p) => basename(p).toLowerCase().includes(q);
+  const results = new Set(d.results || []);
   for (const sub of d.dirs.filter(match)) {
     const label = d.dir === "" ? (sub === "." ? "zeyu-co-tracker (repo root)" : sub) : basename(sub);
-    add(`📁 ${label}/`, "dir", () => browseTo(sub).catch((e) => toast(e.message)));
+    if (results.has(sub) && !pickerTarget.isCompare) {
+      add(`📊 ${label}/  — tracking result, click to load`, "dir result", () => chooseResult(sub));
+    } else {
+      add(`📁 ${label}/`, "dir", () => browseTo(sub).catch((e) => toast(e.message)));
+    }
   }
   for (const f of d.files.filter(match)) add(`🎞 ${basename(f)}`, "file", () => choose(f));
   if (!list.children.length || (d.parent !== null && list.children.length === 1)) {
@@ -361,6 +375,33 @@ function drawPickerList() {
     li.className = "empty";
     li.textContent = q ? "Nothing matches the filter." : "No videos or folders here.";
     list.appendChild(li);
+  }
+}
+
+// Load an existing tracking result folder (tracks.npy, tracks.mp4, meta.json) into an A/B block.
+async function chooseResult(dir) {
+  rememberDir(dirOf(dir));
+  $("#picker").close();
+  const b = pickerTarget;
+  try {
+    setStatus(b, "Loading tracking result…");
+    const info = await api(`/api/result?dir=${encodeURIComponent(dir)}`);
+    const metaOf = (p) => (p ? api(`/api/meta?path=${encodeURIComponent(p)}`) : null);
+    const [srcMeta, resMeta] = await Promise.all([metaOf(info.source), metaOf(info.video)]);
+    if (b.job && b.job.status === "running") await cancelJob(b);
+    stopPolling(b);
+    b.job = null;
+    b.src = srcMeta;
+    b.result = { dir: info.dir, meta: resMeta, loaded: true, hasMeta: info.has_meta, label: basename(info.dir) };
+    b.view = resMeta ? "result" : "source";
+    const notes = [];
+    if (!info.video) notes.push("no tracks.mp4 in this folder (it can still be compared)");
+    if (!info.has_meta) notes.push("no meta.json: source video unknown, use it as the second video in Compare");
+    else if (!info.source) notes.push("its source video (from meta.json) was not found");
+    setStatus(b, notes.length ? "Note: " + notes.join("; ") + "." : "");
+    showVideo(b);
+  } catch (err) {
+    setStatus(b, err.message, true);
   }
 }
 

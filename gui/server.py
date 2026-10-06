@@ -134,21 +134,43 @@ def browse(dir: str = "", kind: str = "video"):
     exts = VIDEO_EXT if kind == "video" else IMAGE_EXT
     if not dir:
         starts = [d for d in BROWSE_DIRS + [REPO / "outputs", REPO] + HOST_MOUNTS if d.is_dir()]
-        return {"dir": "", "parent": None, "dirs": [rel(d) if d != REPO else "." for d in starts], "files": []}
+        return {"dir": "", "parent": None, "dirs": [rel(d) if d != REPO else "." for d in starts],
+                "files": [], "results": []}
     d = resolve(dir)
     if not d.is_dir():
         raise HTTPException(404, f"folder not found: {dir}")
-    dirs, files = [], []
+    dirs, files, results = [], [], []  # results: subfolders holding a tracking result
     for e in sorted(d.iterdir(), key=lambda e: e.name.lower()):
         if e.name.startswith("."):
             continue
         if e.is_dir():
             dirs.append(rel(e))
+            if (e / "tracks.npy").is_file():
+                results.append(rel(e))
         elif e.suffix.lower() in exts:
             files.append(rel(e))
     at_root = d in ROOTS
     parent = "" if at_root else (rel(d.parent) if d.parent != REPO else ".")
-    return {"dir": rel(d) if d != REPO else ".", "parent": parent, "dirs": dirs, "files": files}
+    return {"dir": rel(d) if d != REPO else ".", "parent": parent, "dirs": dirs, "files": files,
+            "results": results}
+
+
+@app.get("/api/result")
+def result(dir: str):
+    """An existing tracking result folder: its visualization and (if known) its source video."""
+    d = resolve(dir)
+    if not (d / "tracks.npy").is_file():
+        raise HTTPException(400, f"not a tracking result (no tracks.npy): {dir}")
+    source = None
+    try:
+        v = json.load(open(d / "meta.json"))["video"]
+        sp = resolve(v)
+        source = rel(sp) if sp.is_file() else None
+    except (OSError, KeyError, ValueError, HTTPException):
+        pass
+    video = d / "tracks.mp4"
+    return {"dir": rel(d), "video": rel(video) if video.is_file() else None, "source": source,
+            "has_meta": (d / "meta.json").is_file()}
 
 
 @app.post("/api/upload")
@@ -225,6 +247,7 @@ class CompareReq(BaseModel):
     time: str = "truncate"
     radius: int = 2
     vmax: float | None = None
+    video_a: str = ""  # source video of the first result; needed when it has no meta.json
 
 
 def out_dir(name: str) -> Path:
@@ -309,6 +332,8 @@ def compare(r: CompareReq):
            "--radius", str(r.radius)]
     if r.vmax:
         cmd += ["--vmax", str(r.vmax)]
+    if r.video_a:
+        cmd += ["--video", rel(resolve(r.video_a))]
     return start_job("compare", cmd, out, out, out / "compare.mp4")
 
 
