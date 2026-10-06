@@ -266,6 +266,9 @@ class CompareReq(BaseModel):
     radius: int = 2
     vmax: float | None = None
     video_a: str = ""  # source video of the first result; needed when it has no meta.json
+    mask_video: str = ""  # optional: compare only points inside its white area
+    mask_step: int = 5
+    mask_rule: str = "both"
 
 
 def out_dir(name: str) -> Path:
@@ -353,6 +356,11 @@ def compare(r: CompareReq):
         cmd += ["--vmax", str(r.vmax)]
     if r.video_a:
         cmd += ["--video", rel(resolve(r.video_a))]
+    if r.mask_video:
+        if r.mask_rule not in {"both", "a", "either"}:
+            raise HTTPException(400, "mask_rule must be both, a or either")
+        cmd += ["--mask_video", rel(resolve(r.mask_video)), "--mask_step", str(max(1, r.mask_step)),
+                "--mask_rule", r.mask_rule]
     return start_job("compare", cmd, out, out, out / "compare.mp4")
 
 

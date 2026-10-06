@@ -199,6 +199,8 @@ button.link:hover { text-decoration: underline; }
 .fields label.key { color: var(--muted); }
 .fields .help { grid-column: 2; color: var(--muted); font-size: 11px; margin-top: -6px; }
 .fields .gpu-list { display: flex; flex-direction: column; gap: 2px; }
+.fields .pathfield { display: flex; gap: 4px; }
+.fields .pathfield input { flex: 1; min-width: 0; }
 
 #toast {
   position: fixed;

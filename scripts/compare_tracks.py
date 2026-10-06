@@ -21,6 +21,8 @@ Outputs (in --out, default outputs/compare/<A>_vs_<B>/):
     per_frame.csv   frame, mean, median, p95, max, n_valid
     diff_over_time.png
     paired.npy      bool    (T, N_A) A point has a B partner that is visible in both at frame t
+                                     (and inside the mask, with --mask_video)
+    in_mask.npy     bool    (T, N)  with --mask_video: pair is inside the mask at frame t
     compare.mp4     video A. --view pairs (default): green = paired at that frame, gray = no
                     pair (no B partner, or hidden in A or B). --view diff: colored by |A - B|.
 """
@@ -109,6 +111,43 @@ def colorbar(frame, vmax, cmap_lut):
     cv2.putText(frame, "px", (x0, y0 + bh + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
 
+def mask_selection(args, A, B, T, size_a, stride):
+    """Which pairs lie inside the mask, consulting it every args.mask_step frames.
+
+    A, B: (T, N, 2) positions in A's pixel space. Returns in_mask (T, N) bool and
+    {frame: (H, W) bool mask} for the consulted frames (for drawing)."""
+    W, H = size_a
+    vid = iio.imread(args.mask_video, plugin="FFMPEG")[::stride]
+    gray = vid.mean(-1) if vid.ndim == 4 else vid
+    if gray.shape[1:] != (H, W):
+        print(f"note: mask video is {gray.shape[2]}x{gray.shape[1]}, sources are {W}x{H}; resizing mask")
+    if len(gray) < T:
+        print(f"note: mask video has {len(gray)} frames, tracks have {T}; reusing its last frame")
+    step = max(1, args.mask_step)
+    in_mask = np.zeros(A.shape[:2], bool)
+    masks = {}
+
+    def inside(P, m):
+        x, y = np.round(P[:, 0]).astype(int), np.round(P[:, 1]).astype(int)
+        ok = (x >= 0) & (x < W) & (y >= 0) & (y < H)
+        res = np.zeros(len(P), bool)
+        res[ok] = m[y[ok], x[ok]]
+        return res
+
+    for m0 in range(0, T, step):
+        g = gray[min(m0, len(gray) - 1)]
+        if g.shape != (H, W):
+            g = cv2.resize(g.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
+        m = g > 127
+        masks[m0] = m
+        ia, ib = inside(A[m0], m), inside(B[m0], m)
+        sel = ia & ib if args.mask_rule == "both" else ia if args.mask_rule == "a" else ia | ib
+        in_mask[m0 : m0 + step] = sel
+    print(f"mask: consulted every {step} frames ({len(masks)} times), rule '{args.mask_rule}'; "
+          f"on average {in_mask.sum(1).mean():.0f} of {A.shape[1]} points inside")
+    return in_mask, masks
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--a", required=True, help="track output dir of video A (drawn on)")
@@ -132,6 +171,14 @@ def main():
     p.add_argument("--radius", type=int, default=2)
     p.add_argument("--fps", type=float, default=None, help="default: source fps / stride")
     p.add_argument("--out", default=None)
+    p.add_argument("--mask_video", default=None,
+                   help="video of the same size/length as the sources; only points inside its "
+                   "white area are compared")
+    p.add_argument("--mask_step", type=int, default=5,
+                   help="consult the mask every N frames (frames 0, N, 2N, ...); the selection "
+                   "holds until the next one")
+    p.add_argument("--mask_rule", choices=["both", "a", "either"], default="both",
+                   help="point counts if inside the mask in both A and B / in A only / in either")
     args = p.parse_args()
 
     A, visA, qA, metaA = load_run(args.a, args.query_frame)
@@ -186,6 +233,11 @@ def main():
     else:
         b_on_a = B
     valid = visA & visB
+    stride = args.frame_stride or metaA.get("frame_stride", 1)
+    mask_frames = None
+    if args.mask_video:
+        in_mask, mask_frames = mask_selection(args, A, B, T, size_a, stride)
+        valid &= in_mask
     diff_vec = A - b_on_a  # (T, N, 2)
     diff_vec[~valid] = np.nan
     diff = np.linalg.norm(diff_vec, axis=-1)
@@ -200,6 +252,8 @@ def main():
     np.save(os.path.join(out, "b_on_a.npy"), b_on_a.astype(np.float32))
     np.save(os.path.join(out, "pairs.npy"), pairs)
     np.save(os.path.join(out, "paired.npy"), paired)
+    if mask_frames is not None:
+        np.save(os.path.join(out, "in_mask.npy"), in_mask)
 
     stats = []
     with open(os.path.join(out, "per_frame.csv"), "w", newline="") as f:
@@ -228,7 +282,6 @@ def main():
           f"p95 {np.nanpercentile(diff, 95):.2f} px; colormap max {vmax:.2f} px")
 
     # Draw on video A (same frame subsampling as A's tracking).
-    stride = args.frame_stride or metaA.get("frame_stride", 1)
     frames = iio.imread(video_path, plugin="FFMPEG")[::stride][:T]
     if len(frames) < T:
         raise SystemExit(f"video A has {len(frames)} frames after stride, tracks have {T}")
@@ -241,6 +294,10 @@ def main():
     green, gray = (0, 255, 0), (160, 160, 160)
     for t in range(T):
         fr = np.ascontiguousarray(frames[t])
+        if mask_frames is not None:  # outline of the mask consulted for this frame
+            cs, _ = cv2.findContours(mask_frames[(t // args.mask_step) * args.mask_step].astype(np.uint8),
+                                     cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(fr, cs, -1, (255, 255, 255), 1, cv2.LINE_AA)
         if args.view == "pairs":
             for i in np.where(~paired[t])[0]:
                 cv2.circle(fr, tuple(np.round(A_all[t, i]).astype(int)), args.radius, gray, -1, cv2.LINE_AA)

@@ -59,8 +59,17 @@ const COMPARE_FIELDS = [
   { key: "time", label: "Frame count mismatch", type: "select", options: ["truncate", "resample"] },
   { key: "radius", label: "Dot radius (px)", type: "number", min: 0 },
   { key: "vmax", label: "Color max (px)", type: "number", min: 0, help: "diff view only; empty = 95th percentile." },
+  { key: "mask_video", label: "Mask video", type: "videopath",
+    help: "Optional. Same size and length as the sources; only points inside its white area are compared (video, numbers and curve)." },
+  { key: "mask_step", label: "Mask step (frames)", type: "number", min: 1,
+    help: "Consult the mask every N frames (0, N, 2N, …); the selected points hold until the next one." },
+  { key: "mask_rule", label: "Point counts if inside", type: "select",
+    options: [["both", "the mask in both A and B"], ["a", "the mask in the first video"], ["either", "the mask in either video"]] },
 ];
-const COMPARE_DEFAULTS = { direction: "A vs B", view: "pairs", metric: "position", time: "truncate", radius: 2, vmax: "" };
+const COMPARE_DEFAULTS = {
+  direction: "A vs B", view: "pairs", metric: "position", time: "truncate", radius: 2, vmax: "",
+  mask_video: "", mask_step: 5, mask_rule: "both",
+};
 
 // ------------------------------------------------------------------ state
 
@@ -271,6 +280,7 @@ async function runJob(b) {
       slot: b.id, a: first.result.dir, b: second.result.dir, video_a: first.src ? first.src.path : "",
       view: p.view, metric: p.metric,
       time: p.time, radius: Number(p.radius), vmax: p.vmax === "" ? null : Number(p.vmax),
+      mask_video: (p.mask_video || "").trim(), mask_step: Number(p.mask_step) || 5, mask_rule: p.mask_rule,
     });
   } else {
     const p = b.params;
@@ -351,9 +361,12 @@ function rememberDir(dir) {
 }
 const dirOf = (path) => (path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : ".");
 
-async function openPicker(b) {
+let pickerCallback = null;  // set when the picker fills a form field instead of loading a block
+
+async function openPicker(b, onPick = null) {
   pickerTarget = b;
-  $("#picker h2").textContent = b.isCompare ? "Load a video" : "Select source video";
+  pickerCallback = onPick;
+  $("#picker h2").textContent = onPick ? "Select mask video" : b.isCompare ? "Load a video" : "Select source video";
   $("#picker-status").textContent = "";
   $("#picker").showModal();
   try {
@@ -434,6 +447,11 @@ async function chooseResult(dir) {
 async function choose(path, remember = true) {
   if (remember) rememberDir(dirOf(path));
   $("#picker").close();
+  if (pickerCallback) {
+    pickerCallback(path);
+    pickerCallback = null;
+    return;
+  }
   try {
     await setSource(pickerTarget, path);
   } catch (err) {
@@ -512,8 +530,31 @@ async function fieldInput(f, value) {
   if (f.type === "select") {
     const s = document.createElement("select");
     s.name = f.key;
-    for (const o of f.options) s.add(new Option(o, o, false, o === value));
+    for (const o of f.options) {
+      const [v, label] = Array.isArray(o) ? o : [o, o];
+      s.add(new Option(label, v, false, v === value));
+    }
     return s;
+  }
+  if (f.type === "videopath") {
+    const d = document.createElement("div");
+    d.className = "pathfield";
+    const i = document.createElement("input");
+    i.type = "text";
+    i.name = f.key;
+    i.value = value || "";
+    i.placeholder = "(none)";
+    const browse = document.createElement("button");
+    browse.type = "button";
+    browse.textContent = "Browse…";
+    browse.onclick = () => openPicker(paramsTarget, (path) => { i.value = path; });
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.textContent = "×";
+    clear.title = "No mask";
+    clear.onclick = () => { i.value = ""; };
+    d.append(i, browse, clear);
+    return d;
   }
   if (f.type === "checkbox") {
     const c = document.createElement("input");
