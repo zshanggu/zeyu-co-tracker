@@ -39,6 +39,7 @@ ROOTS = [REPO, Path("/data")] + HOST_MOUNTS
 BROWSE_DIRS = [REPO / "source_video", REPO / "assets", Path("/data")]
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp"}
+EXTS = {"video": VIDEO_EXT, "image": IMAGE_EXT, "npy": {".npy"}}
 
 app = FastAPI()
 jobs = {}
@@ -132,7 +133,7 @@ def list_files(kind: str = "video"):
 @app.get("/api/browse")
 def browse(dir: str = "", kind: str = "video"):
     """One folder's subfolders and matching files. Empty dir = the start locations."""
-    exts = VIDEO_EXT if kind == "video" else IMAGE_EXT
+    exts = EXTS.get(kind, VIDEO_EXT)
     if not dir:
         starts = [d for d in BROWSE_DIRS + [REPO / "outputs", REPO] + HOST_MOUNTS if d.is_dir()]
         return {"dir": "", "parent": None, "dirs": [rel(d) if d != REPO else "." for d in starts],
@@ -266,7 +267,7 @@ class CompareReq(BaseModel):
     radius: int = 2
     vmax: float | None = None
     video_a: str = ""  # source video of the first result; needed when it has no meta.json
-    mask_video: str = ""  # optional: compare only points inside its white area
+    mask: str = ""  # optional .npy mask: compare only points inside its True area
     mask_step: int = 5
     mask_rule: str = "both"
 
@@ -356,10 +357,10 @@ def compare(r: CompareReq):
         cmd += ["--vmax", str(r.vmax)]
     if r.video_a:
         cmd += ["--video", rel(resolve(r.video_a))]
-    if r.mask_video:
+    if r.mask:
         if r.mask_rule not in {"both", "a", "either"}:
             raise HTTPException(400, "mask_rule must be both, a or either")
-        cmd += ["--mask_video", rel(resolve(r.mask_video)), "--mask_step", str(max(1, r.mask_step)),
+        cmd += ["--mask", rel(resolve(r.mask)), "--mask_step", str(max(1, r.mask_step)),
                 "--mask_rule", r.mask_rule]
     return start_job("compare", cmd, out, out, out / "compare.mp4")
 

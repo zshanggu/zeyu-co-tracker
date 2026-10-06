@@ -21,8 +21,8 @@ Outputs (in --out, default outputs/compare/<A>_vs_<B>/):
     per_frame.csv   frame, mean, median, p95, max, n_valid
     diff_over_time.png
     paired.npy      bool    (T, N_A) A point has a B partner that is visible in both at frame t
-                                     (and inside the mask, with --mask_video)
-    in_mask.npy     bool    (T, N)  with --mask_video: pair is inside the mask at frame t
+                                     (and inside the mask, with --mask)
+    in_mask.npy     bool    (T, N)  with --mask: pair is inside the mask at frame t
     compare.mp4     video A. --view pairs (default): green = paired at that frame, gray = no
                     pair (no B partner, or hidden in A or B). --view diff: colored by |A - B|.
 """
@@ -117,12 +117,19 @@ def mask_selection(args, A, B, T, size_a, stride):
     A, B: (T, N, 2) positions in A's pixel space. Returns in_mask (T, N) bool and
     {frame: (H, W) bool mask} for the consulted frames (for drawing)."""
     W, H = size_a
-    vid = iio.imread(args.mask_video, plugin="FFMPEG")[::stride]
-    gray = vid.mean(-1) if vid.ndim == 4 else vid
-    if gray.shape[1:] != (H, W):
-        print(f"note: mask video is {gray.shape[2]}x{gray.shape[1]}, sources are {W}x{H}; resizing mask")
-    if len(gray) < T:
-        print(f"note: mask video has {len(gray)} frames, tracks have {T}; reusing its last frame")
+    # (T, H, W) bool per source frame, e.g. X_demo_008_01_mask_stack.npy; or one (H, W) mask.
+    stack = np.load(args.mask, mmap_mode="r")  # memory-mapped: only consulted frames are read
+    if stack.ndim == 2:
+        stack = stack[None]
+    if stack.ndim != 3:
+        raise SystemExit(f"mask {args.mask}: expected (T, H, W) or (H, W), got {stack.shape}")
+    if len(stack) > 1:
+        stack = stack[::stride]  # mask frames follow the source video
+    Tm, Hm, Wm = stack.shape
+    if (Hm, Wm) != (H, W):
+        print(f"note: mask is {Wm}x{Hm}, sources are {W}x{H}; resizing mask")
+    if 1 < Tm < T:
+        print(f"note: mask has {Tm} frames, tracks have {T}; reusing its last frame")
     step = max(1, args.mask_step)
     in_mask = np.zeros(A.shape[:2], bool)
     masks = {}
@@ -135,10 +142,9 @@ def mask_selection(args, A, B, T, size_a, stride):
         return res
 
     for m0 in range(0, T, step):
-        g = gray[min(m0, len(gray) - 1)]
-        if g.shape != (H, W):
-            g = cv2.resize(g.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
-        m = g > 127
+        m = np.asarray(stack[min(m0, Tm - 1)]) > 0  # True / non-zero = inside
+        if m.shape != (H, W):
+            m = cv2.resize(m.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
         masks[m0] = m
         ia, ib = inside(A[m0], m), inside(B[m0], m)
         sel = ia & ib if args.mask_rule == "both" else ia if args.mask_rule == "a" else ia | ib
@@ -171,9 +177,9 @@ def main():
     p.add_argument("--radius", type=int, default=2)
     p.add_argument("--fps", type=float, default=None, help="default: source fps / stride")
     p.add_argument("--out", default=None)
-    p.add_argument("--mask_video", default=None,
-                   help="video of the same size/length as the sources; only points inside its "
-                   "white area are compared")
+    p.add_argument("--mask", default=None,
+                   help=".npy mask, (T, H, W) bool per source frame (or one (H, W)), same size as "
+                   "the sources; only points inside its True area are compared")
     p.add_argument("--mask_step", type=int, default=5,
                    help="consult the mask every N frames (frames 0, N, 2N, ...); the selection "
                    "holds until the next one")
@@ -235,7 +241,7 @@ def main():
     valid = visA & visB
     stride = args.frame_stride or metaA.get("frame_stride", 1)
     mask_frames = None
-    if args.mask_video:
+    if args.mask:
         in_mask, mask_frames = mask_selection(args, A, B, T, size_a, stride)
         valid &= in_mask
     diff_vec = A - b_on_a  # (T, N, 2)
