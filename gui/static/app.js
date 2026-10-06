@@ -113,7 +113,9 @@ function makeBlock(row, col) {
     </div>
     <div class="stage">
       <video muted playsinline preload="auto"></video>
-      ${isCompare ? '<canvas class="curve" hidden></canvas>' : ""}
+      ${isCompare ? `<canvas class="curve" hidden></canvas>
+      <label class="ymax" hidden title="Upper bound of the curve's y axis; empty = automatic">y max
+        <input type="number" min="0" step="any" placeholder="auto"> px</label>` : ""}
       <div class="placeholder"><div>${isCompare
         ? "Track A and B in this row, then press <b>Compare</b> (⚙ for A vs B or B vs A),<br>or <b>Select video</b> to load an existing one."
         : "Press <b>Select video</b> to choose a source video."}</div></div>
@@ -172,6 +174,7 @@ function render(b) {
     const on = !!(stats && b.showCurve);
     $(".stage", b.el).classList.toggle("with-curve", on);
     $("canvas.curve", b.el).hidden = !on;
+    $("label.ymax", b.el).hidden = !on;
     if (on) drawCurve(b);
   }
 }
@@ -705,13 +708,12 @@ document.addEventListener("keydown", (e) => {
 });
 
 // ------------------------------------------------------------------ difference curve
-// Per-frame mean / median / 95th-percentile difference (per_frame.csv of the compare run),
+// Per-frame mean / median difference (per_frame.csv of the compare run),
 // with a marker at the current frame; hover shows values, click jumps to that frame.
 
 const CURVE_SERIES = [
   { key: "mean", label: "mean", light: "#2a78d6", dark: "#3987e5", dash: [] },
   { key: "median", label: "median", light: "#eb6834", dark: "#d95926", dash: [] },
-  { key: "p95", label: "95th pct", light: "#1baf7a", dark: "#199e70", dash: [6, 4] },
 ];
 const darkMode = window.matchMedia("(prefers-color-scheme: dark)");
 
@@ -725,6 +727,11 @@ async function loadStats(meta) {
 
 function setupCurve(b) {
   const cv = $("canvas.curve", b.el);
+  $("label.ymax input", b.el).addEventListener("input", (e) => {
+    const v = parseFloat(e.target.value);
+    b.curveYMax = v > 0 ? v : null;  // empty / 0 -> automatic
+    drawCurve(b);
+  });
   cv.addEventListener("mousemove", (e) => {
     b.hoverFrame = curveFrameAt(b, e);
     drawCurve(b);
@@ -794,10 +801,17 @@ function drawCurve(b) {
   const n = st.frame.length;
   const pw = w - g.left - g.right, ph = h - g.top - g.bottom;
   if (n < 1 || pw < 20 || ph < 20) return;
-  const top = Math.max(0, ...st.p95.filter((v) => v != null), ...st.mean.filter((v) => v != null));
-  const step = niceStep(top);
-  const nTicks = Math.max(1, Math.ceil(top / step));
-  const ymax = step * nTicks;
+  let ymax, step, nTicks;
+  if (b.curveYMax) {  // user-set upper bound; larger values are clipped at the top
+    ymax = b.curveYMax;
+    step = niceStep(ymax);
+    nTicks = Math.max(1, Math.floor(ymax / step + 1e-9));
+  } else {
+    const top = Math.max(0, ...CURVE_SERIES.flatMap((s) => st[s.key].filter((v) => v != null)));
+    step = niceStep(top);
+    nTicks = Math.max(1, Math.ceil(top / step));
+    ymax = step * nTicks;
+  }
   const X = (i) => g.left + (n === 1 ? pw / 2 : (i / (n - 1)) * pw);
   const Y = (v) => g.top + ph - (v / ymax) * ph;
   ctx.font = "11px system-ui, sans-serif";
@@ -827,7 +841,11 @@ function drawCurve(b) {
   ctx.fillText("px", 0, 0);
   ctx.restore();
 
-  // series lines (gaps where a frame has no valid points)
+  // series lines (gaps where a frame has no valid points), clipped to the plot area
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(g.left - 5, g.top, pw + 10, ph + 5);
+  ctx.clip();
   for (const s of CURVE_SERIES) {
     ctx.strokeStyle = s[mode];
     ctx.lineWidth = 2;
@@ -843,11 +861,12 @@ function drawCurve(b) {
     ctx.stroke();
     ctx.setLineDash([]);
   }
+  ctx.restore();
   // direct labels at line ends (text in ink, short color key beside it), nudged apart
   const ends = CURVE_SERIES.map((s) => {
     let i = n - 1;
     while (i > 0 && st[s.key][i] == null) i--;
-    return { s, y: st[s.key][i] == null ? null : Y(st[s.key][i]) };
+    return { s, y: st[s.key][i] == null ? null : Math.max(g.top, Y(st[s.key][i])) };
   }).filter((e) => e.y != null).sort((a, b) => a.y - b.y);
   for (let k = 1; k < ends.length; k++) ends[k].y = Math.max(ends[k].y, ends[k - 1].y + 13);
   ctx.textAlign = "left";
@@ -889,7 +908,7 @@ function drawCurve(b) {
     for (const s of CURVE_SERIES) {
       const v = st[s.key][f];
       if (v == null) continue;
-      ctx.beginPath(); ctx.arc(X(f), Y(v), 4, 0, 2 * Math.PI);
+      ctx.beginPath(); ctx.arc(X(f), Math.max(g.top, Y(v)), 4, 0, 2 * Math.PI);  // pinned at top if above y max
       ctx.fillStyle = s[mode]; ctx.fill();
       ctx.lineWidth = 2; ctx.strokeStyle = surface; ctx.stroke();
     }
