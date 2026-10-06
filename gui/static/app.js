@@ -383,9 +383,10 @@ async function openPicker(b, onPick = null, kind = "video") {
   pickerTarget = b;
   pickerCallback = onPick;
   pickerKind = kind;
-  $("#picker h2").textContent =
-    kind === "npy" ? "Select mask (.npy)" : b.isCompare ? "Load a video" : "Select source video";
+  $("#picker h2").textContent = kind === "dir" ? "Select root folder"
+    : kind === "npy" ? "Select mask (.npy)" : b && b.isCompare ? "Load a video" : "Select source video";
   $("#picker-upload-btn").hidden = kind !== "video";
+  $("#picker-use-dir").hidden = kind !== "dir";
   $("#picker-status").textContent = "";
   $("#picker").showModal();
   try {
@@ -421,7 +422,7 @@ function drawPickerList() {
   const results = new Set(d.results || []);
   for (const sub of d.dirs.filter(match)) {
     const label = d.dir === "" ? (sub === "." ? "zeyu-co-tracker (repo root)" : sub) : basename(sub);
-    if (results.has(sub) && !pickerTarget.isCompare && !pickerCallback) {
+    if (results.has(sub) && pickerTarget && !pickerTarget.isCompare && !pickerCallback) {
       add(`📊 ${label}/  — tracking result, click to load`, "dir result", () => chooseResult(sub));
     } else {
       add(`📁 ${label}/`, "dir", () => browseTo(sub).catch((e) => toast(e.message)));
@@ -441,7 +442,11 @@ function drawPickerList() {
 async function chooseResult(dir) {
   rememberDir(dirOf(dir));
   $("#picker").close();
-  const b = pickerTarget;
+  await loadResult(pickerTarget, dir);
+}
+
+// Load an existing tracking result folder into a track block.
+async function loadResult(b, dir) {
   try {
     setStatus(b, "Loading tracking result…");
     const info = await api(`/api/result?dir=${encodeURIComponent(dir)}`);
@@ -1104,6 +1109,218 @@ async function syncState() {
     if (remote && (remote.version || 0) > (b.version || 0) && !busy(b)) await applyState(b, remote);
   }
 }
+
+// ------------------------------------------------------------------ batch pipeline
+// For every demo_* folder under a root: track A, track B, extract the mask from the instance
+// video, then a masked compare (scripts/batch_pipeline.py). One batch runs at a time on the
+// server; any page can watch it and load a finished demo into a row of the grid.
+
+const BATCH_TRACK_FIELDS = TRACK_FIELDS.filter((f) => !["grid_query_frame", "mask"].includes(f.key));
+const BATCH_MASK_FIELDS = [
+  { key: "colors", label: "Color(s) R,G,B", type: "text",
+    help: 'Selected color block in the instance video; several separated by ";".' },
+  { key: "tolerance", label: "Tolerance", type: "number", min: 0,
+    help: "Max RGB distance from the color that still counts as mask (mask_gui uses 30)." },
+  { key: "cleanup", label: "Clean-up", type: "checkbox", help: "Morphological close, then open (as in mask_gui)." },
+  { key: "close", label: "Close kernel (px)", type: "number", min: 0 },
+  { key: "open", label: "Open kernel (px)", type: "number", min: 0 },
+];
+const BATCH_COMPARE_FIELDS = COMPARE_FIELDS.filter((f) => f.key !== "mask");
+const BATCH_DEFAULTS = () => ({
+  track: Object.fromEntries(BATCH_TRACK_FIELDS.map((f) => [f.key, structuredClone(TRACK_DEFAULTS[f.key])])),
+  mask: { colors: "167,18,135", tolerance: 30, cleanup: true, close: 5, open: 3 },
+  compare: { ...Object.fromEntries(BATCH_COMPARE_FIELDS.map((f) => [f.key, COMPARE_DEFAULTS[f.key]])),
+             direction: "B vs A" },
+});
+const STEP_COLS = [["track_a", "Track A"], ["track_b", "Track B"], ["mask", "Mask"], ["compare", "Compare"]];
+let batchPoll = null;
+
+function readFields(box, fields, obj) {
+  for (const f of fields) {
+    if (f.type === "gpus") obj.gpus = [...box.querySelectorAll('input[name="gpus"]:checked')].map((c) => Number(c.value));
+    else if (f.type === "checkbox") obj[f.key] = box.querySelector(`[name="${f.key}"]`).checked;
+    else obj[f.key] = box.querySelector(`[name="${f.key}"]`).value;
+  }
+  return obj;
+}
+
+async function fillFields(box, fields, values) {
+  box.innerHTML = "";
+  for (const f of fields) {
+    const lab = document.createElement("label");
+    lab.className = "key";
+    lab.textContent = f.label;
+    box.appendChild(lab);
+    box.appendChild(await fieldInput(f, values[f.key]));
+    if (f.help) {
+      const h = document.createElement("div");
+      h.className = "help";
+      h.textContent = f.help;
+      box.appendChild(h);
+    }
+  }
+}
+
+async function openBatch() {
+  try { S.gpus = (await api("/api/gpus")).gpus; } catch { /* keep last list */ }
+  const cur = (await api("/api/batch")).batch;
+  const cfg = BATCH_DEFAULTS();
+  if (cur && cur.config) {  // prefill with the last batch's settings
+    for (const k of ["track", "mask", "compare"]) Object.assign(cfg[k], cur.config[k] || {});
+    $("#batch-root").value = cur.config.root || "";
+    $("#batch-a").value = cur.config.a_suffix ?? "_source";
+    $("#batch-b").value = cur.config.b_suffix ?? "_01";
+    $("#batch-i").value = cur.config.instance_suffix ?? "_instance";
+    $("#batch-skip").checked = !!cur.config.skip_existing;
+  } else if (!$("#batch-root").value) {
+    $("#batch-root").value = "source_video/not_reviewed";
+  }
+  await fillFields($("#batch-track"), BATCH_TRACK_FIELDS, cfg.track);
+  await fillFields($("#batch-mask"), BATCH_MASK_FIELDS, cfg.mask);
+  await fillFields($("#batch-compare"), BATCH_COMPARE_FIELDS, cfg.compare);
+  $("#batch-msg").textContent = "";
+  $("#batch-scan-result").textContent = "";
+  renderBatch(cur);
+  $("#batch").showModal();
+  clearInterval(batchPoll);
+  batchPoll = setInterval(refreshBatch, 2000);
+}
+
+async function refreshBatch() {
+  let cur = null;
+  try { cur = (await api("/api/batch")).batch; } catch { return; }
+  if ($("#batch").open) renderBatch(cur);
+  const btn = $("#btn-batch");
+  const p = cur && cur.progress;
+  if (cur && cur.job_status === "running" && p) {
+    const demos = Object.values(p.demos);
+    const done = demos.filter((d) => Object.values(d).every((s) => s.status !== "pending" && s.status !== "running")).length;
+    btn.textContent = `Batch… (running ${done}/${demos.length})`;
+  } else {
+    btn.textContent = "Batch…";
+  }
+}
+
+function batchScanQuery() {
+  const q = new URLSearchParams({ root: $("#batch-root").value.trim(), a_suffix: $("#batch-a").value,
+                                  b_suffix: $("#batch-b").value, instance_suffix: $("#batch-i").value });
+  return `/api/batch/scan?${q}`;
+}
+
+async function scanBatch() {
+  const box = $("#batch-scan-result");
+  box.textContent = "Scanning…";
+  try {
+    const r = await api(batchScanQuery());
+    if (!r.demos.length) {
+      box.innerHTML = `<span class="missing">No demo_* folders in ${r.root}.</span>`;
+      return r;
+    }
+    const lines = r.demos.map((d) => {
+      const miss = [!d.a && "A", !d.b && "B", !d.instance && "instance"].filter(Boolean);
+      return miss.length ? `<div class="missing">${d.name}: missing ${miss.join(", ")}</div>` : "";
+    }).join("");
+    const ok = r.demos.filter((d) => d.a && d.b && d.instance).length;
+    box.innerHTML = `${r.demos.length} demo folders in <code>${r.root}</code> (${ok} complete) → results in <code>${r.out}</code>${lines}`;
+    return r;
+  } catch (err) {
+    box.innerHTML = `<span class="missing">${err.message}</span>`;
+    return null;
+  }
+}
+
+async function startBatch() {
+  const scan = await scanBatch();
+  if (!scan || !scan.demos.length) return;
+  const num = (o, keys) => { for (const k of keys) if (o[k] !== "" && o[k] != null) o[k] = Number(o[k]); return o; };
+  const track = num(readFields($("#batch-track"), BATCH_TRACK_FIELDS, {}),
+                    ["radius", "chunk_size", "segment_len", "frame_stride", "max_frames"]);
+  if (!track.gpus.length && S.gpus.length) return toast("Select at least one GPU for tracking.");
+  const mask = num(readFields($("#batch-mask"), BATCH_MASK_FIELDS, {}), ["tolerance", "open", "close"]);
+  const compare = num(readFields($("#batch-compare"), BATCH_COMPARE_FIELDS, {}), ["radius", "mask_step"]);
+  compare.vmax = compare.vmax === "" ? null : Number(compare.vmax);
+  try {
+    await postJSON("/api/batch/start", {
+      root: $("#batch-root").value.trim(), a_suffix: $("#batch-a").value, b_suffix: $("#batch-b").value,
+      instance_suffix: $("#batch-i").value, skip_existing: $("#batch-skip").checked, track, mask, compare,
+    });
+    $("#batch-msg").textContent = `Batch started: ${scan.demos.length} demos.`;
+    refreshBatch();
+  } catch (err) {
+    $("#batch-msg").textContent = err.message;
+  }
+}
+
+function renderBatch(cur) {
+  const running = !!cur && cur.job_status === "running";
+  $("#batch-start").disabled = running;
+  $("#batch-cancel").hidden = !running;
+  $("#batch-progress").hidden = !cur;
+  if (!cur) return;
+  const p = cur.progress;
+  const stateText = {
+    running: p && p.current ? `running — ${p.current}` : "running…", done: "finished",
+    cancelled: "cancelled", failed: "stopped with an error", lost: "interrupted (server restarted)",
+  }[cur.job_status] || cur.job_status;
+  $("#batch-state").textContent = `· ${cur.root} → ${cur.out} · ${stateText}`;
+  $("#batch-log").textContent = cur.tail || "";
+  const table = $("#batch-table");
+  if (!p) { table.innerHTML = "<tr><td>Starting…</td></tr>"; return; }
+  const head = "<tr><th>Demo</th>" + STEP_COLS.map(([, l]) => `<th>${l}</th>`).join("") + "<th>Load into grid</th></tr>";
+  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const rows = Object.entries(p.demos).map(([name, steps]) => {
+    const cells = STEP_COLS.map(([k]) => {
+      const st = steps[k] || { status: "pending" };
+      const tip = [st.note, st.error].filter(Boolean).join("\n");
+      const secs = st.seconds != null ? ` ${st.seconds}s` : "";
+      return `<td title="${esc(tip)}"><span class="st ${st.status}">${st.status}</span>${secs}</td>`;
+    }).join("");
+    const loadable = ["track_a", "track_b", "compare"].some((k) => steps[k] && steps[k].dir &&
+                                                         ["done", "skipped"].includes(steps[k].status));
+    const load = loadable ? `<button type="button" data-load="0" data-demo="${esc(name)}">Row 1</button>
+      <button type="button" data-load="1" data-demo="${esc(name)}">Row 2</button>` : "";
+    return `<tr><td>${esc(name)}</td>${cells}<td>${load}</td></tr>`;
+  }).join("");
+  table.innerHTML = head + rows;
+  table.dataset.progress = JSON.stringify(p.demos);
+}
+
+// Put a finished demo into a grid row: A and B tracking results, and the comparison.
+async function loadDemo(row, steps) {
+  const ok = (s) => s && s.dir && ["done", "skipped"].includes(s.status);
+  if (ok(steps.track_a)) await loadResult(rowBlock(row, 0), steps.track_a.dir);
+  if (ok(steps.track_b)) await loadResult(rowBlock(row, 1), steps.track_b.dir);
+  if (ok(steps.compare)) {
+    const c = rowBlock(row, 2);
+    try { await setSource(c, `${steps.compare.dir}/compare.mp4`); } catch (err) { setStatus(c, err.message, true); }
+  }
+  $("#batch").close();
+  toast(`Loaded into ${ROW_NAMES[row]}`);
+}
+
+$("#btn-batch").onclick = () => openBatch().catch((e) => toast(e.message));
+$("#batch-scan").onclick = () => scanBatch();
+$("#batch-start").onclick = () => startBatch();
+$("#batch-cancel").onclick = async () => {
+  try { await postJSON("/api/batch/cancel", {}); refreshBatch(); } catch (err) { toast(err.message); }
+};
+$("#batch-browse").onclick = () => openPicker(null, (dir) => { $("#batch-root").value = dir; scanBatch(); }, "dir");
+$("#batch-table").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-load]");
+  if (!btn) return;
+  const demos = JSON.parse($("#batch-table").dataset.progress || "{}");
+  loadDemo(Number(btn.dataset.load), demos[btn.dataset.demo] || {}).catch((err) => toast(err.message));
+});
+$("#batch").addEventListener("close", () => clearInterval(batchPoll));
+$("#picker-use-dir").onclick = () => {
+  if (!pickerData.dir) return toast("Open a folder first.");
+  rememberDir(pickerData.dir);
+  $("#picker").close();
+  if (pickerCallback) pickerCallback(pickerData.dir);
+  pickerCallback = null;
+};
+refreshBatch();
+setInterval(refreshBatch, 5000);
 
 // ------------------------------------------------------------------ init
 

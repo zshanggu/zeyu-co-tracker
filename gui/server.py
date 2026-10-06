@@ -39,7 +39,7 @@ ROOTS = [REPO, Path("/data")] + HOST_MOUNTS
 BROWSE_DIRS = [REPO / "source_video", REPO / "assets", Path("/data")]
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp"}
-EXTS = {"video": VIDEO_EXT, "image": IMAGE_EXT, "npy": {".npy"}}
+EXTS = {"video": VIDEO_EXT, "image": IMAGE_EXT, "npy": {".npy"}, "dir": set()}
 
 app = FastAPI()
 jobs = {}
@@ -508,6 +508,100 @@ def cancel(jid: str):
             except ProcessLookupError:
                 pass
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- batch pipeline
+# One batch at a time: scripts/batch_pipeline.py runs as a job; its progress file
+# (<out>/batch_status.json) and a pointer in outputs/gui/.batch.json let any page show it.
+BATCH_FILE = GUI_OUT / ".batch.json"
+
+
+class BatchReq(BaseModel):
+    root: str
+    a_suffix: str = "_source"
+    b_suffix: str = "_01"
+    instance_suffix: str = "_instance"
+    skip_existing: bool = False
+    track: dict = {}
+    mask: dict = {}
+    compare: dict = {}
+
+
+def batch_out(root: Path) -> Path:
+    return GUI_OUT / root.name  # outputs/gui/<root folder name>/demo_*/...
+
+
+@app.get("/api/batch/scan")
+def batch_scan(root: str, a_suffix: str = "_source", b_suffix: str = "_01",
+               instance_suffix: str = "_instance"):
+    r = resolve(root)
+    if not r.is_dir():
+        raise HTTPException(404, f"folder not found: {root}")
+    demos = []
+    for d in sorted(x for x in r.iterdir() if x.is_dir() and x.name.startswith("demo_")):
+        has = lambda suf: (d / f"{d.name}{suf}.mp4").is_file()
+        demos.append(dict(name=d.name, a=has(a_suffix), b=has(b_suffix), instance=has(instance_suffix)))
+    return {"root": rel(r), "out": rel(batch_out(r)), "demos": demos}
+
+
+def current_batch():
+    try:
+        info = json.load(open(BATCH_FILE))
+    except (OSError, ValueError):
+        return None
+    with jobs_lock:
+        job = jobs.get(info.get("job"))
+        info["job_status"] = job["status"] if job else "lost"  # unknown job: server restarted
+    try:
+        info["progress"] = json.load(open(REPO / info["out"] / "batch_status.json"))
+    except (OSError, ValueError):
+        info["progress"] = None
+    if info["job_status"] == "lost" and info["progress"] and info["progress"].get("finished"):
+        info["job_status"] = "done"  # finished before the restart
+    info["tail"] = read_tail(REPO / info["out"] / "job.log", 15)
+    return info
+
+
+@app.get("/api/batch")
+def batch_get():
+    return {"batch": current_batch()}
+
+
+@app.post("/api/batch/start")
+def batch_start(r: BatchReq):
+    cur = current_batch()
+    if cur and cur["job_status"] == "running":
+        raise HTTPException(409, "a batch is already running; cancel it first")
+    root = resolve(r.root)
+    if not root.is_dir():
+        raise HTTPException(404, f"folder not found: {r.root}")
+    out = batch_out(root)
+    out.mkdir(parents=True, exist_ok=True)
+    cfg = dict(r.model_dump(), root=rel(root), out=rel(out))
+    if cfg["mask"].get("colors"):
+        try:
+            sys.path.insert(0, str(REPO / "scripts"))
+            from extract_mask import parse_colors
+            parse_colors(cfg["mask"]["colors"])
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    with open(out / "batch_config.json", "w") as f:
+        json.dump(cfg, f, indent=2)
+    (out / "batch_status.json").unlink(missing_ok=True)  # don't show the previous run's progress
+    res = start_job("batch", [sys.executable, "scripts/batch_pipeline.py", "--config",
+                              rel(out / "batch_config.json")], out, out, out / "batch_status.json")
+    with open(BATCH_FILE, "w") as f:
+        json.dump({"job": res["job"], "root": rel(root), "out": rel(out), "started": time.time(),
+                   "config": cfg}, f, indent=1)
+    return res
+
+
+@app.post("/api/batch/cancel")
+def batch_cancel():
+    cur = current_batch()
+    if not cur:
+        raise HTTPException(404, "no batch")
+    return cancel(cur["job"])
 
 
 app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")
