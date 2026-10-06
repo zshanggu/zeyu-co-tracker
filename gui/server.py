@@ -208,6 +208,31 @@ def browse(dir: str = "", kind: str = "video"):
             "results": results}
 
 
+# Extra renders that may sit next to a source video (e.g. demo_008/demo_008_depth.mp4).
+MODALITIES = [("depth", "Depth"), ("geoedge", "Canny edge"), ("instance", "Segmentation"),
+              ("normals", "Normals")]
+
+
+@app.get("/api/siblings")
+def siblings(path: str):
+    """Other views of a source video found in its folder: <stem>_<kind>.<ext> first (specific to
+    this video), then <demo folder>_<kind> / <stem minus its last _part>_<kind> (per demo)."""
+    p = resolve(path)
+    folder = p.parent
+    prefixes = [p.stem]
+    if folder.name.startswith("demo_"):
+        prefixes.append(folder.name)
+    if "_" in p.stem:
+        prefixes.append(p.stem.rsplit("_", 1)[0])
+    options = []
+    for key, label in MODALITIES:
+        found = next((f for pre in dict.fromkeys(prefixes) for ext in (".mp4", ".mov", ".webm", ".mkv", ".avi")
+                      if (f := folder / f"{pre}_{key}{ext}").is_file() and f != p), None)
+        if found:
+            options.append({"key": key, "label": label, "path": rel(found)})
+    return {"options": options}
+
+
 @app.get("/api/compare_stats")
 def compare_stats(path: str):
     """Per-frame difference curve of a compare run: per_frame.csv next to its compare.mp4."""

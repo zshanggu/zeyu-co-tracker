@@ -88,10 +88,43 @@ const S = {
   gpus: [],
 };
 
-// A block shows either its source video or its result video (tracked / compared).
+// A block shows its source video, its result video (tracked / compared), or for A/B blocks
+// another render of the source found next to it (depth, edges, segmentation, normals).
 function shown(b) {
   if (b.view === "result" && b.result) return b.result.meta;
+  if (b.extras && b.extras[b.view]) return b.extras[b.view].meta;  // null until its info is loaded
   return b.src;
+}
+
+// Find the extra renders next to the source video (once per source) and load the info of the
+// one being shown.
+async function ensureExtras(b) {
+  if (b.isCompare) return;
+  const path = b.src ? b.src.path : null;
+  if (b.extrasFor !== path) {
+    b.extrasFor = path;
+    b.extras = {};
+    if (path) {
+      try {
+        const { options } = await api(`/api/siblings?path=${encodeURIComponent(path)}`);
+        if (b.extrasFor !== path) return;  // source changed meanwhile
+        b.extras = Object.fromEntries(options.map((o) => [o.key, { ...o, meta: null }]));
+      } catch { /* no extras */ }
+    }
+  }
+  const ex = b.extras[b.view];
+  if (ex && !ex.meta) {
+    ex.meta = await api(`/api/meta?path=${encodeURIComponent(ex.path)}`).catch(() => null);
+  } else if (!["source", "result"].includes(b.view) && !ex) {
+    b.view = b.result ? "result" : "source";  // that render is no longer there
+  }
+  showVideo(b, false);
+}
+
+async function setView(b, view) {
+  b.view = view;
+  await ensureExtras(b);
+  saveBlock(b);
 }
 
 // ------------------------------------------------------------------ block UI
@@ -115,7 +148,8 @@ function makeBlock(row, col) {
         <button data-act="params" title="Parameters">⚙</button>
         <button data-act="run" class="primary">${isCompare ? "Compare A vs B" : "Track"}</button>
         <button data-act="cancel" hidden>Cancel</button>
-        <button data-act="toggle" hidden>Show source</button>
+        ${isCompare ? '<button data-act="toggle" hidden>Show source</button>'
+          : '<select data-act="view" hidden title="What this block shows"></select>'}
         ${isCompare ? '<button data-act="curve" hidden title="Per-frame difference between the two videos">Curve</button>' : ""}
         <button data-act="clear" class="danger">Clear</button>
       </div>
@@ -134,6 +168,8 @@ function makeBlock(row, col) {
   b.video = $("video", el);
   b.video.addEventListener("loadedmetadata", () => seekBlock(b, S.frame));
   if (isCompare) setupCurve(b);
+  const viewSel = $('select[data-act="view"]', el);
+  if (viewSel) viewSel.addEventListener("change", () => setView(b, viewSel.value).catch((e) => toast(e.message)));
   el.addEventListener("click", (e) => {
     const act = e.target.closest("button")?.dataset.act;
     if (act) onAction(b, act);
@@ -145,9 +181,13 @@ function render(b) {
   const meta = shown(b);
   const running = b.job && b.job.status === "running";
   const badge = $(".badge", b.el);
+  const extra = b.extras && b.extras[b.view];
   if (b.result && b.view === "result") {
     badge.textContent = b.isCompare ? "compared" : "tracked";
     badge.className = "badge " + (b.isCompare ? "compared" : "tracked");
+  } else if (extra) {
+    badge.textContent = extra.label.toLowerCase();
+    badge.className = "badge";
   } else {
     badge.textContent = running ? "running…" : b.src ? (b.isCompare ? "loaded" : "source") : "empty";
     badge.className = "badge";
@@ -157,6 +197,7 @@ function render(b) {
     name = b.isCompare ? `${b.result.names[0]} vs ${b.result.names[1]}`
       : b.result.loaded ? `${b.result.label} (loaded result)` : `${videoName(b)} (tracked)`;
   }
+  if (extra && b.src) name = `${basename(b.src.path)} · ${extra.label}`;
   $(".name", b.el).textContent = name;
   $(".name", b.el).title = meta ? meta.path : "";
   $(".placeholder", b.el).hidden = !!meta;
@@ -172,6 +213,21 @@ function render(b) {
     toggle.textContent = b.isCompare
       ? (b.view === "result" ? "Show loaded" : "Show compared")
       : (b.view === "result" ? "Show source" : "Show tracked");
+  }
+  const viewSel = $('select[data-act="view"]', b.el);
+  if (viewSel) {
+    const opts = [];
+    if (b.result) opts.push(["result", "Tracked"]);
+    if (b.src) opts.push(["source", "Source"]);
+    for (const ex of Object.values(b.extras || {})) if (b.src) opts.push([ex.key, ex.label]);
+    const sig = opts.map((o) => o.join(":")).join("|");
+    if (viewSel.dataset.sig !== sig) {  // rebuild only when the choices change
+      viewSel.dataset.sig = sig;
+      viewSel.innerHTML = "";
+      for (const [v, l] of opts) viewSel.add(new Option(`View: ${l}`, v));
+    }
+    viewSel.hidden = opts.length < 2;
+    viewSel.value = b.view;
   }
   const sel = $('[data-act="select"]', b.el);
   if (sel) sel.disabled = running;
@@ -201,7 +257,7 @@ function showStatusText(b, text, failed = false) {
   st.scrollTop = st.scrollHeight;
 }
 
-function showVideo(b) {
+function showVideo(b, checkExtras = true) {
   const meta = shown(b);
   if (!meta) {
     b.video.removeAttribute("src");
@@ -216,6 +272,7 @@ function showVideo(b) {
   if (b.isCompare && meta && meta.stats === undefined) {
     loadStats(meta).then(() => render(b));
   }
+  if (checkExtras && !b.isCompare) ensureExtras(b).catch(() => {});  // A/B: depth, edges, … next to the source
 }
 
 async function onAction(b, act) {
