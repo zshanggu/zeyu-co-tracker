@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -44,6 +44,57 @@ EXTS = {"video": VIDEO_EXT, "image": IMAGE_EXT, "npy": {".npy"}}
 app = FastAPI()
 jobs = {}
 jobs_lock = threading.Lock()
+
+# ---------------------------------------------------------------- shared grid state
+# What each of the 6 blocks shows (source, result, settings, job, status), kept on the server so
+# every browser and every reload sees the same thing. Each change bumps a version number;
+# pages poll /api/state?since=<version> for blocks that changed.
+STATE_FILE = GUI_OUT / ".gui_state.json"
+SLOTS = {f"r{r}{c}" for r in (1, 2) for c in "abc"}
+BLOCK_KEYS = ("src", "result", "view", "params", "showCurve", "curveYMax", "job", "status")
+state_lock = threading.Lock()
+
+
+def _load_state():
+    try:
+        st = json.load(open(STATE_FILE))
+        st["blocks"] = {k: v for k, v in st.get("blocks", {}).items() if k in SLOTS}
+    except (OSError, ValueError):
+        return {"version": 0, "blocks": {}}
+    # Jobs die with the server: anything still "running" in the file was interrupted.
+    for b in st["blocks"].values():
+        if (b.get("job") or {}).get("status") == "running":
+            b["job"]["status"] = "lost"
+            b["status"] = {"text": "The server restarted while this job was running, so it was "
+                                   "stopped. Run it again.", "failed": True}
+    return st
+
+
+state = _load_state()
+
+
+def update_block(slot: str, fn) -> int:
+    """Apply fn(block_dict) to one block under the lock, bump its version, persist."""
+    with state_lock:
+        b = state["blocks"].setdefault(slot, {})
+        fn(b)
+        state["version"] = state.get("version", 0) + 1
+        b["version"] = state["version"]
+        GUI_OUT.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=1)
+        tmp.replace(STATE_FILE)
+        return b["version"]
+
+
+def read_tail(log_path, lines=40) -> str:
+    try:
+        with open(log_path, errors="replace") as f:
+            tail = f.read().replace("\r", "\n").splitlines()[-lines:]
+    except OSError:
+        return ""
+    return "\n".join(l for l in tail if "FutureWarning" not in l and "torch.load" not in l)
 
 
 def resolve(path: str) -> Path:
@@ -250,6 +301,34 @@ def gpus():
     return {"gpus": [dict(index=int(i), name=n, used_mb=int(u), total_mb=int(t)) for i, n, u, t in rows]}
 
 
+# ---------------------------------------------------------------- state API
+
+@app.get("/api/state")
+def get_state(since: int = 0):
+    with state_lock:
+        return {"version": state.get("version", 0),
+                "blocks": {k: v for k, v in state["blocks"].items() if v.get("version", 0) > since}}
+
+
+@app.put("/api/state/{slot}")
+def put_block(slot: str, body: dict = Body(...)):
+    if slot not in SLOTS:
+        raise HTTPException(404, f"unknown block {slot}")
+
+    def fn(b):
+        new = {k: body.get(k) for k in BLOCK_KEYS}
+        # Don't let a page that hasn't seen a job finish yet overwrite the server's outcome.
+        old_job, new_job = b.get("job") or {}, new.get("job") or {}
+        if (old_job.get("id") and old_job.get("id") == new_job.get("id")
+                and old_job.get("status") != "running" and new_job.get("status") == "running"):
+            for k in ("job", "result", "view", "status"):
+                new[k] = b.get(k)
+        b.clear()
+        b.update(new)
+
+    return {"version": update_block(slot, fn)}
+
+
 # ---------------------------------------------------------------- jobs
 
 class TrackReq(BaseModel):
@@ -278,6 +357,7 @@ class CompareReq(BaseModel):
     radius: int = 2
     vmax: float | None = None
     video_a: str = ""  # source video of the first result; needed when it has no meta.json
+    names: list[str] = []  # display names of the two videos (first, second)
     mask: str = ""  # optional .npy mask: compare only points inside its True area
     mask_step: int = 5
     mask_rule: str = "both"
@@ -305,7 +385,8 @@ def video_stem(track_dir: Path) -> str:
         return track_dir.name
 
 
-def start_job(kind: str, cmd: list[str], out: Path, result_dir: Path, result_video: Path):
+def start_job(kind: str, cmd: list[str], out: Path, result_dir: Path, result_video: Path,
+              slot: str = "", result_extra: dict | None = None):
     jid = uuid.uuid4().hex[:12]
     log_path = out / "job.log"
     env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID", PYTHONUNBUFFERED="1")
@@ -318,14 +399,39 @@ def start_job(kind: str, cmd: list[str], out: Path, result_dir: Path, result_vid
                result_dir=rel(result_dir), result_video=rel(result_video), started=time.time())
     with jobs_lock:
         jobs[jid] = job
+    if slot in SLOTS:
+        def started(b):
+            b["job"] = {"id": jid, "status": "running"}
+            b["status"] = {"text": "Starting…", "failed": False}
+        update_block(slot, started)
 
     def wait():
         rc = proc.wait()
         log.close()
         with jobs_lock:
-            if job["status"] == "running":
-                ok = rc == 0 and result_video.exists()
-                job["status"] = "done" if ok else "failed"
+            status = job["status"]
+        if status == "running":
+            status = "done" if rc == 0 and result_video.exists() else "failed"
+        # Record the outcome in the block state first, so a page that sees the job finish
+        # finds the result already there.
+        if slot in SLOTS:
+            def finished(b):
+                if (b.get("job") or {}).get("id") != jid:
+                    return  # block moved on (cleared / new video) while the job ran
+                b["job"] = {"id": jid, "status": status}
+                if status == "done":
+                    b["result"] = dict(dir=rel(result_dir), video=rel(result_video), loaded=False,
+                                       **(result_extra or {}))
+                    b["view"] = "result"
+                    b["status"] = None
+                elif status == "cancelled":
+                    b["status"] = {"text": "Cancelled.", "failed": True}
+                else:
+                    b["status"] = {"text": f"{status.upper()} (exit {rc})\n{read_tail(log_path)}",
+                                   "failed": True}
+            update_block(slot, finished)
+        with jobs_lock:
+            job["status"] = status
             job["returncode"] = rc
 
     threading.Thread(target=wait, daemon=True).start()
@@ -351,7 +457,7 @@ def track(r: TrackReq):
         cmd.append("--backward_tracking")
     if r.mask:
         cmd += ["--mask", rel(resolve(r.mask))]
-    return start_job("track", cmd, out, out, out / "tracks.mp4")
+    return start_job("track", cmd, out, out, out / "tracks.mp4", slot=r.slot)
 
 
 @app.post("/api/compare")
@@ -373,7 +479,8 @@ def compare(r: CompareReq):
             raise HTTPException(400, "mask_rule must be both, a or either")
         cmd += ["--mask", rel(resolve(r.mask)), "--mask_step", str(max(1, r.mask_step)),
                 "--mask_rule", r.mask_rule]
-    return start_job("compare", cmd, out, out, out / "compare.mp4")
+    return start_job("compare", cmd, out, out, out / "compare.mp4", slot=r.slot,
+                     result_extra={"names": r.names})
 
 
 @app.get("/api/jobs/{jid}")
@@ -383,12 +490,7 @@ def job_status(jid: str, lines: int = 40):
         if job is None:
             raise HTTPException(404)
         info = {k: v for k, v in job.items() if k != "proc"}
-    try:
-        with open(info["log"], errors="replace") as f:
-            tail = f.read().replace("\r", "\n").splitlines()[-lines:]
-    except OSError:
-        tail = []
-    info["tail"] = "\n".join(l for l in tail if "FutureWarning" not in l and "torch.load" not in l)
+    info["tail"] = read_tail(info["log"], lines)
     info["elapsed"] = round(time.time() - info["started"], 1)
     return info
 

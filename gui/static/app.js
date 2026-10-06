@@ -189,6 +189,12 @@ function render(b) {
 }
 
 function setStatus(b, text, failed = false) {
+  b.status = text ? { text, failed } : null;
+  showStatusText(b, text, failed);
+}
+
+// Display only (not saved): used for the live job log while a job runs.
+function showStatusText(b, text, failed = false) {
   const st = $(".status", b.el);
   st.textContent = text || "";
   st.classList.toggle("failed", failed);
@@ -222,9 +228,11 @@ async function onAction(b, act) {
     else if (act === "curve") {
       b.showCurve = !b.showCurve;
       render(b);
+      saveBlock(b);
     } else if (act === "toggle") {
       b.view = b.view === "result" ? "source" : "result";
       showVideo(b);
+      saveBlock(b);
     }
   } catch (err) {
     toast(err.message);
@@ -241,6 +249,7 @@ async function setSource(b, path) {
   b.view = "source";
   setStatus(b, "");
   showVideo(b);
+  saveBlock(b);
 }
 
 async function clearBlock(b) {
@@ -252,6 +261,7 @@ async function clearBlock(b) {
   b.view = "source";
   setStatus(b, "");
   showVideo(b);
+  saveBlock(b);
 }
 
 // ------------------------------------------------------------------ jobs
@@ -277,7 +287,8 @@ async function runJob(b) {
       return;
     }
     job = await postJSON("/api/compare", {
-      slot: b.id, a: first.result.dir, b: second.result.dir, video_a: first.src ? first.src.path : "",
+      slot: b.id, names: b.names,
+      a: first.result.dir, b: second.result.dir, video_a: first.src ? first.src.path : "",
       view: p.view, metric: p.metric,
       time: p.time, radius: Number(p.radius), vmax: p.vmax === "" ? null : Number(p.vmax),
       mask: (p.mask || "").trim(), mask_step: Number(p.mask_step) || 5, mask_rule: p.mask_rule,
@@ -299,6 +310,11 @@ async function runJob(b) {
   b.job = { id: job.job, status: "running" };
   setStatus(b, "Starting…");
   render(b);
+  saveBlock(b);
+  startPolling(b);
+}
+
+function startPolling(b) {
   stopPolling(b);
   b.poll = setInterval(() => pollJob(b), 1000);
 }
@@ -309,27 +325,25 @@ async function pollJob(b) {
   try {
     info = await api(`/api/jobs/${b.job.id}`);
   } catch (err) {
+    // The server no longer knows this job (it was restarted).
     stopPolling(b);
-    setStatus(b, `Lost job: ${err.message}`, true);
+    b.job.status = "lost";
+    setStatus(b, "This job was lost (the server restarted). Run it again.", true);
+    render(b);
+    saveBlock(b);
     return;
   }
-  b.job.status = info.status;
   if (info.status === "running") {
-    setStatus(b, `Running ${info.elapsed}s…\n${info.tail}`);
-  } else {
-    stopPolling(b);
-    if (info.status === "done") {
-      const meta = await api(`/api/meta?path=${encodeURIComponent(info.result_video)}`);
-      b.result = { dir: info.result_dir, meta, names: b.names || [] };
-      b.view = "result";
-      setStatus(b, "");
-      showVideo(b);
-      toast(`${ROW_NAMES[b.row]} · ${COL_NAMES[b.col]}: ${b.isCompare ? "compare" : "tracking"} finished`);
-    } else {
-      setStatus(b, `${info.status.toUpperCase()} (exit ${info.returncode ?? "-"})\n${info.tail}`, true);
-    }
+    showStatusText(b, `Running ${info.elapsed}s…\n${info.tail}`);
+    return;
   }
-  render(b);
+  // Finished: the server has already recorded the outcome in the shared state.
+  stopPolling(b);
+  const st = (await api("/api/state")).blocks[b.id];
+  if (st) await applyState(b, st);
+  if (info.status === "done") {
+    toast(`${ROW_NAMES[b.row]} · ${COL_NAMES[b.col]}: ${b.isCompare ? "compare" : "tracking"} finished`);
+  }
 }
 
 function stopPolling(b) {
@@ -344,6 +358,7 @@ async function cancelJob(b) {
   stopPolling(b);
   setStatus(b, "Cancelled.", true);
   render(b);
+  saveBlock(b);
 }
 
 // ------------------------------------------------------------------ picker dialog
@@ -436,7 +451,8 @@ async function chooseResult(dir) {
     stopPolling(b);
     b.job = null;
     b.src = srcMeta;
-    b.result = { dir: info.dir, meta: resMeta, loaded: true, hasMeta: info.has_meta, label: basename(info.dir) };
+    b.result = { dir: info.dir, video: info.video, meta: resMeta, loaded: true, hasMeta: info.has_meta,
+                 label: basename(info.dir) };
     b.view = resMeta ? "result" : "source";
     const notes = [];
     if (!info.video) notes.push("no tracks.mp4 in this folder (it can still be compared)");
@@ -444,6 +460,7 @@ async function chooseResult(dir) {
     else if (!info.source) notes.push("its source video (from meta.json) was not found");
     setStatus(b, notes.length ? "Note: " + notes.join("; ") + "." : "");
     showVideo(b);
+    saveBlock(b);
   } catch (err) {
     setStatus(b, err.message, true);
   }
@@ -621,6 +638,7 @@ $("#params").addEventListener("close", async () => {
   if (!b) return;
   readParams(b);
   render(b);
+  saveBlock(b);
   if ($("#params").returnValue === "run") {
     try {
       await runJob(b);
@@ -777,6 +795,7 @@ function setupCurve(b) {
     const v = parseFloat(e.target.value);
     b.curveYMax = v > 0 ? v : null;  // empty / 0 -> automatic
     drawCurve(b);
+    saveBlock(b);
   });
   cv.addEventListener("mousemove", (e) => {
     b.hoverFrame = curveFrameAt(b, e);
@@ -1003,6 +1022,89 @@ function drawCurve(b) {
   });
 }
 
+// ------------------------------------------------------------------ shared state
+// Each block's state is kept on the server (outputs/gui/.gui_state.json), so reloading the page
+// or opening it in another browser shows the same grid. Every change is saved (debounced);
+// every 2 s the page picks up blocks changed elsewhere. Playback position stays per page.
+
+function blockState(b) {
+  const r = b.result;
+  return {
+    src: b.src ? b.src.path : null,
+    result: r ? { dir: r.dir, video: r.meta ? r.meta.path : r.video || null, loaded: !!r.loaded,
+                  hasMeta: r.hasMeta ?? true, label: r.label || null, names: r.names || [] } : null,
+    view: b.view,
+    params: b.params,
+    showCurve: !!b.showCurve,
+    curveYMax: b.curveYMax || null,
+    job: b.job ? { id: b.job.id, status: b.job.status } : null,
+    status: b.status || null,
+  };
+}
+
+function saveBlock(b) {
+  b.dirty = true;
+  clearTimeout(b.saveTimer);
+  b.saveTimer = setTimeout(async () => {
+    try {
+      const res = await api(`/api/state/${b.id}`, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(blockState(b)),
+      });
+      b.version = res.version;
+    } catch (err) {
+      toast(`Could not save ${ROW_NAMES[b.row]} · ${COL_NAMES[b.col]}: ${err.message}`);
+    }
+    b.dirty = false;
+  }, 300);
+}
+
+// Rebuild a block from its saved state.
+async function applyState(b, st) {
+  b.version = st.version || 0;
+  stopPolling(b);
+  const defaults = structuredClone(b.isCompare ? COMPARE_DEFAULTS : TRACK_DEFAULTS);
+  b.params = { ...defaults, ...(st.params || {}) };
+  b.restored = true;
+  b.showCurve = !!st.showCurve;
+  b.curveYMax = st.curveYMax || null;
+  const ymax = $("label.ymax input", b.el);
+  if (ymax) ymax.value = b.curveYMax || "";
+  b.view = st.view || "source";
+  b.job = st.job ? { ...st.job } : null;
+  const metaOf = (p) => (p ? api(`/api/meta?path=${encodeURIComponent(p)}`).catch(() => null) : null);
+  const [src, res] = await Promise.all([metaOf(st.src), metaOf(st.result && st.result.video)]);
+  b.src = src;
+  b.result = st.result ? { ...st.result, meta: res } : null;
+  b.status = st.status || null;
+  const missing = [st.src && !src && st.src, st.result && st.result.video && !res && st.result.video]
+    .filter(Boolean);
+  if (missing.length) {
+    showStatusText(b, `File no longer available: ${missing.join(", ")}`, true);
+  } else {
+    showStatusText(b, b.status ? b.status.text : "", b.status ? b.status.failed : false);
+  }
+  showVideo(b);
+  if (b.job && b.job.status === "running") startPolling(b);
+}
+
+// A block being edited here (dialog open, unsaved change) is not overwritten by remote state.
+function busy(b) {
+  return b.dirty || ($("#params").open && paramsTarget === b) || ($("#picker").open && pickerTarget === b);
+}
+
+async function syncState() {
+  let st;
+  try {
+    st = await api("/api/state");
+  } catch {
+    return;  // server unreachable: try again next time
+  }
+  for (const b of S.blocks) {
+    const remote = st.blocks[b.id];
+    if (remote && (remote.version || 0) > (b.version || 0) && !busy(b)) await applyState(b, remote);
+  }
+}
+
 // ------------------------------------------------------------------ init
 
 for (let row = 0; row < 2; row++) {
@@ -1013,12 +1115,16 @@ for (let row = 0; row < 2; row++) {
     render(b);
   }
 }
-api("/api/gpus").then((r) => {
-  S.gpus = r.gpus;
-  // Default to the GPU with the most free memory.
-  if (S.gpus.length) {
-    const best = S.gpus.reduce((a, g) => (g.total_mb - g.used_mb > a.total_mb - a.used_mb ? g : a));
-    for (const b of S.blocks) if (!b.isCompare) b.params.gpus = [best.index];
-  }
-}).catch(() => {});
 refreshTimeline();
+(async () => {
+  await syncState();  // restore the shared grid
+  try {
+    S.gpus = (await api("/api/gpus")).gpus;
+    // Blocks without saved settings default to the GPU with the most free memory.
+    if (S.gpus.length) {
+      const best = S.gpus.reduce((a, g) => (g.total_mb - g.used_mb > a.total_mb - a.used_mb ? g : a));
+      for (const b of S.blocks) if (!b.isCompare && !b.restored) b.params.gpus = [best.index];
+    }
+  } catch { /* no GPU info */ }
+  setInterval(syncState, 2000);
+})();
