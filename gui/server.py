@@ -170,6 +170,17 @@ def compare_stats(path: str):
             for k in cols:
                 v = float(row[k])
                 cols[k].append(None if v != v else v)  # NaN (no valid points) -> null
+    summary_path = csv_path.parent / "summary.json"
+    if summary_path.is_file():
+        cols["summary"] = json.load(open(summary_path))
+    else:  # compare runs made before summary.json existed: everything but the overall median
+        m, n = cols["mean"], cols["n_valid"]
+        trap = lambda y: sum((a + b) / 2 for a, b in zip(y, y[1:]) if a is not None and b is not None)
+        tot = sum(c for v, c in zip(m, n) if v is not None)
+        cols["summary"] = dict(
+            overall_mean=sum(v * c for v, c in zip(m, n) if v is not None) / tot if tot else None,
+            overall_median=None, auc_mean=trap(m), auc_median=trap(cols["median"]),
+        )
     return cols
 
 

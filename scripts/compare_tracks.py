@@ -19,6 +19,8 @@ Outputs (in --out, default outputs/compare/<A>_vs_<B>/):
     b_on_a.npy      float32 (T, N, 2) where B's point lands in A's pixel space
     pairs.npy       int     (N, 2)  matched point indices (index in A, index in B)
     per_frame.csv   frame, mean, median, p95, max, n_valid
+    summary.json    overall mean / median over all compared points and frames, and the area
+                    under the per-frame mean and median curves (px * frames)
     diff_over_time.png
     paired.npy      bool    (T, N_A) A point has a B partner that is visible in both at frame t
                                      (and inside the mask, with --mask)
@@ -154,6 +156,31 @@ def mask_selection(args, A, B, T, size_a, stride):
     return in_mask, masks
 
 
+def curve_auc(y):
+    """Area under a per-frame curve (trapezoid rule, 1 frame apart), in px * frames.
+    Frames without compared points (NaN) break the curve; those gaps add nothing."""
+    y = np.asarray(y, float)
+    both = ~np.isnan(y[:-1]) & ~np.isnan(y[1:])
+    return float(((y[:-1] + y[1:]) / 2)[both].sum())
+
+
+def summarize(diff, stats):
+    """diff: (T, N) per-point differences (NaN = not compared); stats: per-frame rows of
+    [mean, median, p95, max]."""
+    has = ~np.isnan(diff)
+    num = lambda v: None if v is None or np.isnan(v) else round(float(v), 4)
+    return dict(
+        overall_mean=num(diff[has].mean()) if has.any() else None,
+        overall_median=num(np.median(diff[has])) if has.any() else None,
+        auc_mean=num(curve_auc(stats[:, 0])),
+        auc_median=num(curve_auc(stats[:, 1])),
+        auc_unit="px*frames",
+        frames=int(len(diff)),
+        frames_compared=int((~np.isnan(stats[:, 0])).sum()),
+        points_compared=int(has.sum()),
+    )
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--a", required=True, help="track output dir of video A (drawn on)")
@@ -271,6 +298,11 @@ def main():
             stats.append(row)
             w.writerow([t] + [f"{x:.3f}" for x in row] + [len(d)])
     stats = np.array(stats)
+    summary = summarize(diff, stats)
+    with open(os.path.join(out, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"summary: AUC mean {summary['auc_mean']} / median {summary['auc_median']} px*frames, "
+          f"overall mean {summary['overall_mean']} px, overall median {summary['overall_median']} px")
 
     fig, ax = plt.subplots(figsize=(7, 3.5))
     ax.plot(stats[:, 0], label="mean")

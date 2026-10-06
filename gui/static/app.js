@@ -801,7 +801,7 @@ function setupCurve(b) {
 function curveGeom(b) {
   const cv = $("canvas.curve", b.el);
   const w = cv.clientWidth, h = cv.clientHeight;
-  return { cv, w, h, left: 44, right: 64, top: 26, bottom: 22 };
+  return { cv, w, h, left: 44, right: 64, top: 26, bottom: 38 };  // bottom: x labels + summary line
 }
 
 function curveFrameAt(b, e) {
@@ -879,6 +879,18 @@ function drawCurve(b) {
   ctx.fillText(`${st.frame[0]}`, g.left, g.top + ph + 5);
   ctx.textAlign = "right";
   ctx.fillText(`frame ${st.frame[n - 1]}`, g.left + pw, g.top + ph + 5);
+  // whole-run summary (summary.json of the compare run): area under each curve, overall mean/median
+  const sm = st.summary || {};
+  const num = (v, d = 2) => (v == null ? "–" : (+v).toFixed(d));
+  const summaryText = `AUC mean ${num(sm.auc_mean, 1)} · median ${num(sm.auc_median, 1)} px·fr` +
+    `   overall mean ${num(sm.overall_mean)} · median ${num(sm.overall_median)} px`;
+  ctx.fillStyle = ink;
+  ctx.textAlign = "center";
+  let fs = 11;  // shrink to fit narrow blocks
+  while (fs > 8 && ctx.measureText(summaryText).width > w - 8) ctx.font = `${--fs}px system-ui, sans-serif`;
+  ctx.fillText(summaryText, w / 2, g.top + ph + 21);
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.fillStyle = muted;
   ctx.save();
   ctx.translate(11, g.top + ph / 2);
   ctx.rotate(-Math.PI / 2);
