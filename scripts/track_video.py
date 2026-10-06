@@ -21,9 +21,12 @@ Examples:
     python scripts/track_video.py --video v.mp4 --grid_size 60 --gpus 0,1,2,3 --chunk_size 500
 
 Outputs (in --out_dir/<video name>/, or exactly --save_dir if given):
-    tracks.npy      float32 (T, N, 2)  pixel (x, y) per frame, original resolution
+    tracks.npy      float32 (T, N, 2)  pixel (x, y) per frame, original resolution. With segments
+                                       (--segment_len, default 10) point i restarts at its grid
+                                       position on every segment's first frame.
     visibility.npy  bool    (T, N)     whether each point is visible in each frame
-    queries.npy     float32 (N, 3)     (t, x, y) query point of each track
+    queries.npy     float32 (N, 3)     (t, x, y) query point of each track (t relative to the
+                                       segment start when segments are used)
     meta.json       video path, width, height, frames, frame_stride, fps
     tracks.mp4      visualization
 """
@@ -95,13 +98,16 @@ def run_online(model, video, queries, args):
     step = model.step
     model(video_chunk=video, is_first_step=True, queries=queries)
     tracks = vis = None
-    for ind in range(0, T - step, step):
+    for ind in range(0, max(T - step, 1), step):  # at least one window, even for short clips
         tracks, vis = model(video_chunk=video[:, ind : ind + step * 2])
     return tracks[:, :T], vis[:, :T]
 
 
-def gpu_worker(device, frames, chunks, ckpt, args):
-    """Track each chunk of queries on one device; returns [(chunk_idx, tracks, vis)]."""
+def gpu_worker(device, frames, items, ckpt, args):
+    """Track work items (segment, chunk of queries) on one device.
+
+    items: [(seg_idx, chunk_idx, start, end, queries)] -> [(seg_idx, chunk_idx, tracks, vis)],
+    tracks (end-start, n, 2) for frames [start, end) only."""
     if args.mode == "offline":
         model = CoTrackerPredictor(checkpoint=ckpt, offline=True, window_len=60).to(device)
         run = run_offline
@@ -110,10 +116,14 @@ def gpu_worker(device, frames, chunks, ckpt, args):
         run = run_online
     video = torch.from_numpy(frames).to(device).permute(0, 3, 1, 2)[None].float()  # B T C H W
     results = []
-    for idx, q in chunks:
-        tracks, vis = run(model, video, q[None].to(device), args)
-        results.append((idx, tracks[0].cpu(), vis[0].cpu()))
-        print(f"  [{device}] chunk {idx}: {len(q)} points done", flush=True)
+    for seg, idx, start, end, q in items:
+        if end - start < 2:  # a 1-frame segment can't be tracked: points stay at their queries
+            tracks = q[None, None, :, 1:].expand(1, end - start, -1, -1)
+            vis = torch.ones(1, end - start, len(q), dtype=torch.bool)
+        else:
+            tracks, vis = run(model, video[:, start:end], q[None].to(device), args)
+        results.append((seg, idx, tracks[0].cpu(), vis[0].cpu()))
+        print(f"  [{device}] frames {start}-{end - 1}, chunk {idx}: {len(q)} points done", flush=True)
     del model, video
     torch.cuda.empty_cache()
     return results
@@ -131,6 +141,11 @@ def main():
     p.add_argument("--queries", default=None, help='text file of "t x y" rows; overrides grid')
     p.add_argument("--mask", default=None, help="binary mask image; keeps grid points inside it")
     p.add_argument("--backward_tracking", action="store_true", help="offline only")
+    p.add_argument(
+        "--segment_len", type=int, default=10,
+        help="videos longer than this are split into non-overlapping segments of this many frames; "
+        "each segment starts a fresh grid on its first frame. 0 = track the whole video at once.",
+    )
     p.add_argument("--max_frames", type=int, default=0, help="0 = all frames")
     p.add_argument("--frame_stride", type=int, default=1)
     p.add_argument("--gpus", default="all", help='"all" or comma list of visible GPU ids, e.g. 0,1')
@@ -159,23 +174,42 @@ def main():
     T, H, W, _ = frames.shape
     queries = build_queries(args, T, H, W)
     N = len(queries)
+    seg_len = args.segment_len if (args.segment_len > 0 and T > args.segment_len) else 0
+    if seg_len and args.queries:
+        print("note: --queries are tied to specific frames; tracking the whole video (no segments)")
+        seg_len = 0
+    if seg_len:
+        if args.grid_query_frame:
+            print("note: --grid_query_frame is ignored with segments; each segment starts on its first frame")
+        queries[:, 0] = 0  # query time is relative to each segment's first frame
+        segments = [(s, min(s + seg_len, T)) for s in range(0, T, seg_len)]
+    else:
+        segments = [(0, T)]
     chunk_size = args.chunk_size or -(-N // len(devices))
-    chunks = list(enumerate(queries.split(chunk_size)))
+    chunks = list(queries.split(chunk_size))
     print(
         f"video: {T} frames, {W}x{H}, mode={args.mode}, {N} points in "
-        f"{len(chunks)} chunk(s) of <= {chunk_size} on {devices}"
+        f"{len(chunks)} chunk(s) of <= {chunk_size} on {devices}, "
+        + (f"{len(segments)} segments of {seg_len} frames" if seg_len else "whole video at once")
     )
 
-    # Round-robin chunks over devices; one thread per device (CUDA work releases the GIL).
-    per_device = [chunks[i :: len(devices)] for i in range(len(devices))]
+    # Every (segment, chunk) pair is one work item; round-robin over devices, one thread per
+    # device (CUDA work releases the GIL).
+    items = [(si, ci, s, e, q) for si, (s, e) in enumerate(segments) for ci, q in enumerate(chunks)]
+    per_device = [items[i :: len(devices)] for i in range(len(devices))]
     with ThreadPoolExecutor(len(devices)) as ex:
         futures = [
-            ex.submit(gpu_worker, d, frames, c, ckpt, args)
-            for d, c in zip(devices, per_device) if c
+            ex.submit(gpu_worker, d, frames, it, ckpt, args)
+            for d, it in zip(devices, per_device) if it
         ]
-        results = sorted(r for f in futures for r in f.result())
-    tracks = torch.cat([r[1] for r in results], dim=1)  # (T, N, 2)
-    vis = torch.cat([r[2] for r in results], dim=1)  # (T, N)
+        results = sorted((r for f in futures for r in f.result()), key=lambda r: (r[0], r[1]))
+    # Chunks side by side within a segment, segments one after another in time.
+    tracks = torch.cat([
+        torch.cat([r[2] for r in results if r[0] == si], dim=1) for si in range(len(segments))
+    ], dim=0)  # (T, N, 2)
+    vis = torch.cat([
+        torch.cat([r[3] for r in results if r[0] == si], dim=1) for si in range(len(segments))
+    ], dim=0)  # (T, N)
 
     name = os.path.splitext(os.path.basename(args.video))[0]
     out = args.save_dir or os.path.join(args.out_dir, name)
@@ -184,13 +218,13 @@ def main():
     np.save(os.path.join(out, "visibility.npy"), vis.numpy().astype(bool))
     np.save(os.path.join(out, "queries.npy"), queries.numpy())
     meta = dict(video=args.video, width=W, height=H, frames=T, frame_stride=args.frame_stride,
-                fps=iio.immeta(args.video, plugin="FFMPEG").get("fps"))
+                fps=iio.immeta(args.video, plugin="FFMPEG").get("fps"), segment_len=seg_len)
     with open(os.path.join(out, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
     print(f"tracks {tuple(tracks.shape)}, visible fraction {vis.float().mean():.2f} -> {out}")
 
     if not args.no_vis:
-        query_frame = 0 if args.backward_tracking else args.grid_query_frame
+        query_frame = 0 if (args.backward_tracking or seg_len) else args.grid_query_frame
         video = torch.from_numpy(frames).permute(0, 3, 1, 2)[None].float()
         # show_first_frame=0 and our own writer: Visualizer.save_video otherwise repeats the
         # first frame and drops frames ([2:-1]), so tracks.mp4 would not line up with the source.

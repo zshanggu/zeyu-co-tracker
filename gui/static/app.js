@@ -36,15 +36,18 @@ const TRACK_FIELDS = [
   { key: "radius", label: "Dot radius (px)", type: "number", min: 0 },
   { key: "chunk_size", label: "Chunk size", type: "number", min: 0,
     help: "Max points per forward pass; lower it on out-of-memory. 0 = split evenly over GPUs." },
+  { key: "segment_len", label: "Segment length", type: "number", min: 0,
+    help: "Videos longer than this restart tracking every N frames (fresh grid, no overlap). 0 = whole video at once." },
   { key: "frame_stride", label: "Frame stride", type: "number", min: 1, help: "Use every k-th frame." },
   { key: "max_frames", label: "Max frames", type: "number", min: 0, help: "0 = all frames." },
-  { key: "grid_query_frame", label: "Grid start frame", type: "number", min: 0 },
+  { key: "grid_query_frame", label: "Grid start frame", type: "number", min: 0,
+    help: "Only used when the whole video is tracked at once (no segments)." },
   { key: "backward_tracking", label: "Backward tracking", type: "checkbox", help: "Offline only." },
   { key: "mask", label: "Mask image", type: "mask", help: "Optional: keep only grid points inside the mask." },
 ];
 const TRACK_DEFAULTS = {
-  gpus: [0], mode: "offline", grid_size: "100x50", radius: 2, chunk_size: 0, frame_stride: 1,
-  max_frames: 0, grid_query_frame: 0, backward_tracking: false, mask: "",
+  gpus: [0], mode: "offline", grid_size: "200x100", radius: 2, chunk_size: 0, frame_stride: 1,
+  max_frames: 0, grid_query_frame: 0, segment_len: 10, backward_tracking: false, mask: "",
 };
 
 const COMPARE_FIELDS = [
@@ -104,11 +107,13 @@ function makeBlock(row, col) {
         <button data-act="run" class="primary">${isCompare ? "Compare A vs B" : "Track"}</button>
         <button data-act="cancel" hidden>Cancel</button>
         <button data-act="toggle" hidden>Show source</button>
+        ${isCompare ? '<button data-act="curve" hidden title="Per-frame difference between the two videos">Curve</button>' : ""}
         <button data-act="clear" class="danger">Clear</button>
       </div>
     </div>
     <div class="stage">
       <video muted playsinline preload="auto"></video>
+      ${isCompare ? '<canvas class="curve" hidden></canvas>' : ""}
       <div class="placeholder"><div>${isCompare
         ? "Track A and B in this row, then press <b>Compare</b> (⚙ for A vs B or B vs A),<br>or <b>Select video</b> to load an existing one."
         : "Press <b>Select video</b> to choose a source video."}</div></div>
@@ -117,6 +122,7 @@ function makeBlock(row, col) {
   b.el = el;
   b.video = $("video", el);
   b.video.addEventListener("loadedmetadata", () => seekBlock(b, S.frame));
+  if (isCompare) setupCurve(b);
   el.addEventListener("click", (e) => {
     const act = e.target.closest("button")?.dataset.act;
     if (act) onAction(b, act);
@@ -158,6 +164,16 @@ function render(b) {
   }
   const sel = $('[data-act="select"]', b.el);
   if (sel) sel.disabled = running;
+  if (b.isCompare) {
+    const stats = meta && meta.stats;
+    const curveBtn = $('[data-act="curve"]', b.el);
+    curveBtn.hidden = !stats;
+    curveBtn.textContent = b.showCurve ? "Hide curve" : "Curve";
+    const on = !!(stats && b.showCurve);
+    $(".stage", b.el).classList.toggle("with-curve", on);
+    $("canvas.curve", b.el).hidden = !on;
+    if (on) drawCurve(b);
+  }
 }
 
 function setStatus(b, text, failed = false) {
@@ -179,6 +195,9 @@ function showVideo(b) {
   if (!meta) delete b.video.dataset.url;
   render(b);
   refreshTimeline();
+  if (b.isCompare && meta && meta.stats === undefined) {
+    loadStats(meta).then(() => render(b));
+  }
 }
 
 async function onAction(b, act) {
@@ -188,7 +207,10 @@ async function onAction(b, act) {
     else if (act === "run") openParams(b, true);
     else if (act === "cancel") await cancelJob(b);
     else if (act === "clear") await clearBlock(b);
-    else if (act === "toggle") {
+    else if (act === "curve") {
+      b.showCurve = !b.showCurve;
+      render(b);
+    } else if (act === "toggle") {
       b.view = b.view === "result" ? "source" : "result";
       showVideo(b);
     }
@@ -257,6 +279,7 @@ async function runJob(b) {
       slot: b.id, video: b.src.path, gpus: p.gpus, mode: p.mode, grid_size: String(p.grid_size),
       radius: Number(p.radius), chunk_size: Number(p.chunk_size), frame_stride: Number(p.frame_stride),
       max_frames: Number(p.max_frames), grid_query_frame: Number(p.grid_query_frame),
+      segment_len: Number(p.segment_len),
       backward_tracking: !!p.backward_tracking, mask: p.mask || "",
     });
   }
@@ -583,6 +606,7 @@ function refreshTimeline() {
 function updateLabel() {
   $("#slider").value = S.frame;
   $("#frame-label").textContent = `Frame ${S.frame} / ${Math.max(0, S.maxFrames - 1)}`;
+  for (const b of S.blocks) if (b.isCompare && b.showCurve) drawCurve(b);
 }
 
 function seekBlock(b, frame) {
@@ -679,6 +703,228 @@ document.addEventListener("keydown", (e) => {
   else if (e.code === "ArrowLeft") step(-1);
   else if (e.code === "ArrowRight") step(1);
 });
+
+// ------------------------------------------------------------------ difference curve
+// Per-frame mean / median / 95th-percentile difference (per_frame.csv of the compare run),
+// with a marker at the current frame; hover shows values, click jumps to that frame.
+
+const CURVE_SERIES = [
+  { key: "mean", label: "mean", light: "#2a78d6", dark: "#3987e5", dash: [] },
+  { key: "median", label: "median", light: "#eb6834", dark: "#d95926", dash: [] },
+  { key: "p95", label: "95th pct", light: "#1baf7a", dark: "#199e70", dash: [6, 4] },
+];
+const darkMode = window.matchMedia("(prefers-color-scheme: dark)");
+
+async function loadStats(meta) {
+  try {
+    meta.stats = await api(`/api/compare_stats?path=${encodeURIComponent(meta.path)}`);
+  } catch {
+    meta.stats = null; // not a compare video (no per_frame.csv next to it)
+  }
+}
+
+function setupCurve(b) {
+  const cv = $("canvas.curve", b.el);
+  cv.addEventListener("mousemove", (e) => {
+    b.hoverFrame = curveFrameAt(b, e);
+    drawCurve(b);
+  });
+  cv.addEventListener("mouseleave", () => {
+    b.hoverFrame = null;
+    drawCurve(b);
+  });
+  cv.addEventListener("click", (e) => {
+    const f = curveFrameAt(b, e);
+    if (f == null) return;
+    if (S.playing) pause();
+    S.frame = Math.min(f, Math.max(0, S.maxFrames - 1));
+    updateLabel();
+    seekAll(S.frame);
+  });
+  new ResizeObserver(() => b.showCurve && drawCurve(b)).observe($(".stage", b.el));
+  darkMode.addEventListener("change", () => b.showCurve && drawCurve(b));
+}
+
+function curveGeom(b) {
+  const cv = $("canvas.curve", b.el);
+  const w = cv.clientWidth, h = cv.clientHeight;
+  return { cv, w, h, left: 44, right: 64, top: 26, bottom: 22 };
+}
+
+function curveFrameAt(b, e) {
+  const st = shown(b)?.stats;
+  if (!st) return null;
+  const g = curveGeom(b);
+  const n = st.frame.length;
+  const x = e.offsetX - g.left, pw = g.w - g.left - g.right;
+  if (x < -4 || x > pw + 4 || n < 1) return null;
+  return Math.max(0, Math.min(n - 1, Math.round((x / Math.max(1, pw)) * (n - 1))));
+}
+
+// Round tick step (1, 2 or 5 × 10^k) giving about `ticks` intervals up to v.
+function niceStep(v, ticks = 4) {
+  if (!(v > 0)) return 1;
+  const raw = v / ticks, p = 10 ** Math.floor(Math.log10(raw));
+  for (const m of [1, 2, 5, 10]) if (m * p >= raw) return m * p;
+  return 10 * p;
+}
+
+function drawCurve(b) {
+  const meta = shown(b);
+  const st = meta && meta.stats;
+  const g = curveGeom(b);
+  const { cv, w, h } = g;
+  if (!st || !w || !h || cv.hidden) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr);
+    cv.height = Math.round(h * dpr);
+  }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const css = getComputedStyle(document.documentElement);
+  const ink = css.getPropertyValue("--text").trim();
+  const muted = css.getPropertyValue("--muted").trim();
+  const grid = css.getPropertyValue("--border").trim();
+  const surface = css.getPropertyValue("--panel").trim();
+  const mode = darkMode.matches ? "dark" : "light";
+  ctx.fillStyle = surface;
+  ctx.fillRect(0, 0, w, h);
+
+  const n = st.frame.length;
+  const pw = w - g.left - g.right, ph = h - g.top - g.bottom;
+  if (n < 1 || pw < 20 || ph < 20) return;
+  const top = Math.max(0, ...st.p95.filter((v) => v != null), ...st.mean.filter((v) => v != null));
+  const step = niceStep(top);
+  const nTicks = Math.max(1, Math.ceil(top / step));
+  const ymax = step * nTicks;
+  const X = (i) => g.left + (n === 1 ? pw / 2 : (i / (n - 1)) * pw);
+  const Y = (v) => g.top + ph - (v / ymax) * ph;
+  ctx.font = "11px system-ui, sans-serif";
+
+  // recessive grid + y labels
+  ctx.lineWidth = 1;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  for (let k = 0; k <= nTicks; k++) {
+    const v = step * k, y = Math.round(Y(v)) + 0.5;
+    ctx.strokeStyle = grid;
+    ctx.beginPath(); ctx.moveTo(g.left, y); ctx.lineTo(g.left + pw, y); ctx.stroke();
+    ctx.fillStyle = muted;
+    ctx.fillText(`${+v.toFixed(3)}`, g.left - 6, y);
+  }
+  // x labels: first / last frame
+  ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+  ctx.fillText(`${st.frame[0]}`, g.left, g.top + ph + 5);
+  ctx.textAlign = "right";
+  ctx.fillText(`frame ${st.frame[n - 1]}`, g.left + pw, g.top + ph + 5);
+  ctx.save();
+  ctx.translate(11, g.top + ph / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("px", 0, 0);
+  ctx.restore();
+
+  // series lines (gaps where a frame has no valid points)
+  for (const s of CURVE_SERIES) {
+    ctx.strokeStyle = s[mode];
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.setLineDash(s.dash);
+    ctx.beginPath();
+    let pen = false;
+    st[s.key].forEach((v, i) => {
+      if (v == null) { pen = false; return; }
+      pen ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(i), Y(v));
+      pen = true;
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // direct labels at line ends (text in ink, short color key beside it), nudged apart
+  const ends = CURVE_SERIES.map((s) => {
+    let i = n - 1;
+    while (i > 0 && st[s.key][i] == null) i--;
+    return { s, y: st[s.key][i] == null ? null : Y(st[s.key][i]) };
+  }).filter((e) => e.y != null).sort((a, b) => a.y - b.y);
+  for (let k = 1; k < ends.length; k++) ends[k].y = Math.max(ends[k].y, ends[k - 1].y + 13);
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  for (const e of ends) {
+    ctx.strokeStyle = e.s[mode];
+    ctx.lineWidth = 2;
+    ctx.setLineDash(e.s.dash.length ? [3, 2] : []);
+    ctx.beginPath(); ctx.moveTo(g.left + pw + 4, e.y); ctx.lineTo(g.left + pw + 12, e.y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = ink;
+    ctx.fillText(e.s.label, g.left + pw + 15, e.y);
+  }
+  // legend (top-left)
+  let lx = g.left;
+  ctx.textBaseline = "middle";
+  for (const s of CURVE_SERIES) {
+    ctx.strokeStyle = s[mode];
+    ctx.lineWidth = 2;
+    ctx.setLineDash(s.dash.length ? [3, 2] : []);
+    ctx.beginPath(); ctx.moveTo(lx, 11); ctx.lineTo(lx + 14, 11); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = ink;
+    ctx.textAlign = "left";
+    ctx.fillText(s.label, lx + 18, 11);
+    lx += 18 + ctx.measureText(s.label).width + 14;
+  }
+
+  // current-frame marker, and hover crosshair + readout
+  const markers = [[Math.min(S.frame, n - 1), false]];
+  if (b.hoverFrame != null) markers.push([b.hoverFrame, true]);
+  for (const [f, isHover] of markers) {
+    const x = Math.round(X(f)) + 0.5;
+    ctx.strokeStyle = isHover ? muted : ink;
+    ctx.lineWidth = 1;
+    ctx.setLineDash(isHover ? [2, 3] : []);
+    ctx.beginPath(); ctx.moveTo(x, g.top); ctx.lineTo(x, g.top + ph); ctx.stroke();
+    ctx.setLineDash([]);
+    for (const s of CURVE_SERIES) {
+      const v = st[s.key][f];
+      if (v == null) continue;
+      ctx.beginPath(); ctx.arc(X(f), Y(v), 4, 0, 2 * Math.PI);
+      ctx.fillStyle = s[mode]; ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = surface; ctx.stroke();
+    }
+  }
+  const fmt = (v) => (v == null ? "–" : `${v.toFixed(2)} px`);
+  if (b.hoverFrame == null) {
+    // Current frame, one line after the legend.
+    const f = Math.min(S.frame, n - 1);
+    ctx.fillStyle = muted;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(`frame ${st.frame[f]}: mean ${fmt(st.mean[f])}`, lx + 6, 11);
+    return;
+  }
+  const f = b.hoverFrame;
+  const lines = [`frame ${st.frame[f]}  (click to jump)`,
+    ...CURVE_SERIES.map((s) => `${s.label}: ${fmt(st[s.key][f])}`), `points: ${st.n_valid[f] ?? 0}`];
+  const tw = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 14, th = lines.length * 14 + 8;
+  let tx = X(f) + 10;
+  if (tx + tw > w - 4) tx = X(f) - 10 - tw;
+  const ty = g.top + 2;
+  ctx.fillStyle = surface;
+  ctx.strokeStyle = grid;
+  ctx.lineWidth = 1;
+  ctx.globalAlpha = 0.94;
+  ctx.fillRect(tx, ty, tw, th);
+  ctx.globalAlpha = 1;
+  ctx.strokeRect(tx + 0.5, ty + 0.5, tw - 1, th - 1);
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  lines.forEach((l, k) => {
+    ctx.fillStyle = k === 0 ? muted : ink;
+    ctx.fillText(l, tx + 7, ty + 5 + k * 14);
+  });
+}
 
 // ------------------------------------------------------------------ init
 

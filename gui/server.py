@@ -6,6 +6,7 @@ Run inside the CoTracker container (see docker/gui.sh):
 """
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -155,6 +156,22 @@ def browse(dir: str = "", kind: str = "video"):
             "results": results}
 
 
+@app.get("/api/compare_stats")
+def compare_stats(path: str):
+    """Per-frame difference curve of a compare run: per_frame.csv next to its compare.mp4."""
+    p = resolve(path)
+    csv_path = (p if p.is_dir() else p.parent) / "per_frame.csv"
+    if not csv_path.is_file():
+        raise HTTPException(404, "no per_frame.csv for this video")
+    cols = {k: [] for k in ("frame", "mean", "median", "p95", "max", "n_valid")}
+    with open(csv_path) as f:
+        for row in csv.DictReader(f):
+            for k in cols:
+                v = float(row[k])
+                cols[k].append(None if v != v else v)  # NaN (no valid points) -> null
+    return cols
+
+
 @app.get("/api/result")
 def result(dir: str):
     """An existing tracking result folder: its visualization and (if known) its source video."""
@@ -228,12 +245,13 @@ class TrackReq(BaseModel):
     video: str
     gpus: list[int] = [0]
     mode: str = "offline"
-    grid_size: str = "100x50"
+    grid_size: str = "200x100"
     radius: int = 2
     chunk_size: int = 0
     frame_stride: int = 1
     max_frames: int = 0
     grid_query_frame: int = 0
+    segment_len: int = 10
     backward_tracking: bool = False
     mask: str = ""
 
@@ -310,7 +328,8 @@ def track(r: TrackReq):
     cmd = [sys.executable, "scripts/track_video.py", "--video", rel(video), "--save_dir", rel(out),
            "--mode", r.mode, "--grid_size", r.grid_size, "--radius", str(r.radius),
            "--chunk_size", str(r.chunk_size), "--frame_stride", str(r.frame_stride),
-           "--max_frames", str(r.max_frames), "--grid_query_frame", str(r.grid_query_frame)]
+           "--max_frames", str(r.max_frames), "--grid_query_frame", str(r.grid_query_frame),
+           "--segment_len", str(r.segment_len)]
     if r.gpus:
         cmd += ["--gpus", ",".join(str(g) for g in r.gpus)]
     if r.backward_tracking:

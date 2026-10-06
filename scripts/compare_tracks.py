@@ -7,7 +7,7 @@ rescaled to A's pixel space.
 Metrics (--metric), vector = A - B per point and frame:
     position (default)      A[t] - B[t]: difference of absolute positions
     displacement            (A[t] - A[q]) - (B[t] - B[q]): difference of movement since the
-                            query frame q. Identical to "position" when both runs start every
+                            query frame q (since the segment start for segmented tracking). Identical to "position" when both runs start every
                             point at the same pixel (same grid, same resolution).
 
 Example:
@@ -171,7 +171,15 @@ def main():
     T, N = A.shape[:2]
     A_all, visA_all = A_all[:T], visA_all[:T]
 
-    if args.metric == "displacement":
+    seg_a, seg_b = metaA.get("segment_len") or 0, metaB.get("segment_len") or 0
+    if seg_a != seg_b:
+        print(f"WARNING: A and B were tracked with different segment lengths ({seg_a} vs {seg_b}); "
+              "their points restart on different frames")
+    if args.metric == "displacement" and seg_a:
+        # Segmented tracking: movement is measured from the start of each point's current segment.
+        ref = (np.arange(T) // seg_a) * seg_a
+        b_on_a = A[ref] + (B - B[ref])
+    elif args.metric == "displacement":
         tq = np.clip(qA[:, 0].astype(int), 0, T - 1)
         ar = np.arange(N)
         b_on_a = A[tq, ar][None] + (B - B[tq, ar][None])
