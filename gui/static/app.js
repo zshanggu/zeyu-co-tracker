@@ -97,18 +97,18 @@ function makeBlock(row, col) {
       <span class="badge"></span>
       <span class="name"></span>
       <div class="actions">
-        ${isCompare ? "" : '<button data-act="select">Select video</button>'}
+        <button data-act="select" title="${isCompare ? "Load an existing video, e.g. an earlier compare.mp4" : "Choose the source video"}">Select video</button>
         <button data-act="params" title="Parameters">⚙</button>
         <button data-act="run" class="primary">${isCompare ? "Compare A vs B" : "Track"}</button>
         <button data-act="cancel" hidden>Cancel</button>
-        ${isCompare ? "" : '<button data-act="toggle" hidden>Show source</button>'}
+        <button data-act="toggle" hidden>Show source</button>
         <button data-act="clear" class="danger">Clear</button>
       </div>
     </div>
     <div class="stage">
       <video muted playsinline preload="auto"></video>
       <div class="placeholder"><div>${isCompare
-        ? "Track A and B in this row, then press <b>Compare</b>.<br>Use ⚙ to choose A vs B or B vs A."
+        ? "Track A and B in this row, then press <b>Compare</b> (⚙ for A vs B or B vs A),<br>or <b>Select video</b> to load an existing one."
         : "Press <b>Select video</b> to choose a source video."}</div></div>
       <pre class="status"></pre>
     </div>`;
@@ -130,7 +130,7 @@ function render(b) {
     badge.textContent = b.isCompare ? "compared" : "tracked";
     badge.className = "badge " + (b.isCompare ? "compared" : "tracked");
   } else {
-    badge.textContent = running ? "running…" : b.src ? "source" : "empty";
+    badge.textContent = running ? "running…" : b.src ? (b.isCompare ? "loaded" : "source") : "empty";
     badge.className = "badge";
   }
   let name = meta ? basename(meta.path) : "";
@@ -149,7 +149,9 @@ function render(b) {
   const toggle = $('[data-act="toggle"]', b.el);
   if (toggle) {
     toggle.hidden = !(b.src && b.result);
-    toggle.textContent = b.view === "result" ? "Show source" : "Show tracked";
+    toggle.textContent = b.isCompare
+      ? (b.view === "result" ? "Show loaded" : "Show compared")
+      : (b.view === "result" ? "Show source" : "Show tracked");
   }
   const sel = $('[data-act="select"]', b.el);
   if (sel) sel.disabled = running;
@@ -316,6 +318,7 @@ const dirOf = (path) => (path.includes("/") ? path.slice(0, path.lastIndexOf("/"
 
 async function openPicker(b) {
   pickerTarget = b;
+  $("#picker h2").textContent = b.isCompare ? "Load a video" : "Select source video";
   $("#picker-status").textContent = "";
   $("#picker").showModal();
   try {
