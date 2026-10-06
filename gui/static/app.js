@@ -1266,9 +1266,16 @@ function renderBatch(cur) {
   $("#batch-log").textContent = cur.tail || "";
   const table = $("#batch-table");
   if (!p) { table.innerHTML = "<tr><td>Starting…</td></tr>"; return; }
-  const head = "<tr><th>Demo</th>" + STEP_COLS.map(([, l]) => `<th>${l}</th>`).join("") + "<th>Load into grid</th></tr>";
+  const head = "<tr><th>Rank</th><th>Demo</th>" + STEP_COLS.map(([, l]) => `<th>${l}</th>`).join("") +
+    "<th>Load into grid</th><th>Overall mean (px)</th></tr>";
   const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  const rows = Object.entries(p.demos).map(([name, steps]) => {
+  // Compared demos first, ranked by overall mean difference (low = most similar); the rest
+  // (pending, running, failed) after them in folder order.
+  const meanOf = (steps) => (steps.compare && steps.compare.overall_mean != null ? steps.compare.overall_mean : null);
+  const entries = Object.entries(p.demos);
+  const ranked = entries.filter(([, st]) => meanOf(st) != null).sort((a, b) => meanOf(a[1]) - meanOf(b[1]));
+  const rest = entries.filter(([, st]) => meanOf(st) == null);
+  const rows = [...ranked, ...rest].map(([name, steps], i) => {
     const cells = STEP_COLS.map(([k]) => {
       const st = steps[k] || { status: "pending" };
       const tip = [st.note, st.error].filter(Boolean).join("\n");
@@ -1279,7 +1286,10 @@ function renderBatch(cur) {
                                                          ["done", "skipped"].includes(steps[k].status));
     const load = loadable ? `<button type="button" data-load="0" data-demo="${esc(name)}">Row 1</button>
       <button type="button" data-load="1" data-demo="${esc(name)}">Row 2</button>` : "";
-    return `<tr><td>${esc(name)}</td>${cells}<td>${load}</td></tr>`;
+    const mean = meanOf(steps);
+    const rank = mean != null ? i + 1 : "";
+    return `<tr><td>${rank}</td><td>${esc(name)}</td>${cells}<td>${load}</td>` +
+      `<td class="num">${mean != null ? mean.toFixed(2) : "–"}</td></tr>`;
   }).join("");
   table.innerHTML = head + rows;
   table.dataset.progress = JSON.stringify(p.demos);
