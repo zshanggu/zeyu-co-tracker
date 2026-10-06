@@ -250,3 +250,7 @@ dialog#batch { width: min(1000px, 96vw); }
 #batch-msg { color: var(--muted); }
 header { align-items: center; }
 #batch-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+#batch-table th.num { text-align: right; }
+#batch-table .sorted { font-weight: 600; }
+.batch-progress-head { display: flex; align-items: center; gap: 8px; }
+.batch-progress-head label { color: var(--muted); display: flex; align-items: center; gap: 4px; }

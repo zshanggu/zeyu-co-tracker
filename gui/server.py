@@ -556,12 +556,14 @@ def current_batch():
         info["progress"] = json.load(open(REPO / info["out"] / "batch_status.json"))
     except (OSError, ValueError):
         info["progress"] = None
-    # Overall mean difference of each finished comparison (from its summary.json), for ranking.
+    # Difference statistics of each finished comparison (from its summary.json), for ranking.
     for steps in ((info["progress"] or {}).get("demos") or {}).values():
         c = steps.get("compare") or {}
         if c.get("dir") and c.get("status") in ("done", "skipped"):
             try:
-                c["overall_mean"] = json.load(open(REPO / c["dir"] / "summary.json")).get("overall_mean")
+                sm = json.load(open(REPO / c["dir"] / "summary.json"))
+                for k in ("overall_mean", "overall_median", "auc_mean", "auc_median"):
+                    c[k] = sm.get(k)
             except (OSError, ValueError):
                 pass
     if info["job_status"] == "lost" and info["progress"] and info["progress"].get("finished"):

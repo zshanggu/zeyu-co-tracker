@@ -1251,7 +1251,19 @@ async function startBatch() {
   }
 }
 
+// The four difference statistics of a comparison (summary.json); lower = more similar.
+const BATCH_STATS = [
+  ["overall_mean", "Overall mean (px)", 2], ["overall_median", "Overall median (px)", 2],
+  ["auc_mean", "AUC mean (px·fr)", 1], ["auc_median", "AUC median (px·fr)", 1],
+];
+let lastBatch = null;
+
+function rankStat() {
+  try { return localStorage.getItem("cotracker-gui.rankBy") || "overall_mean"; } catch { return "overall_mean"; }
+}
+
 function renderBatch(cur) {
+  lastBatch = cur;
   const running = !!cur && cur.job_status === "running";
   $("#batch-start").disabled = running;
   $("#batch-cancel").hidden = !running;
@@ -1266,15 +1278,19 @@ function renderBatch(cur) {
   $("#batch-log").textContent = cur.tail || "";
   const table = $("#batch-table");
   if (!p) { table.innerHTML = "<tr><td>Starting…</td></tr>"; return; }
+  const by = rankStat();
+  $("#batch-rank").value = by;
   const head = "<tr><th>Rank</th><th>Demo</th>" + STEP_COLS.map(([, l]) => `<th>${l}</th>`).join("") +
-    "<th>Load into grid</th><th>Overall mean (px)</th></tr>";
+    "<th>Load into grid</th>" +
+    BATCH_STATS.map(([k, l]) => `<th class="num${k === by ? " sorted" : ""}">${l}${k === by ? " ▲" : ""}</th>`).join("") +
+    "</tr>";
   const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  // Compared demos first, ranked by overall mean difference (low = most similar); the rest
-  // (pending, running, failed) after them in folder order.
-  const meanOf = (steps) => (steps.compare && steps.compare.overall_mean != null ? steps.compare.overall_mean : null);
+  // Compared demos first, ranked by the selected statistic (low = most similar); the rest
+  // (pending, running, failed, or without that statistic) after them in folder order.
+  const statOf = (steps, k) => (steps.compare && steps.compare[k] != null ? steps.compare[k] : null);
   const entries = Object.entries(p.demos);
-  const ranked = entries.filter(([, st]) => meanOf(st) != null).sort((a, b) => meanOf(a[1]) - meanOf(b[1]));
-  const rest = entries.filter(([, st]) => meanOf(st) == null);
+  const ranked = entries.filter(([, st]) => statOf(st, by) != null).sort((a, b) => statOf(a[1], by) - statOf(b[1], by));
+  const rest = entries.filter(([, st]) => statOf(st, by) == null);
   const rows = [...ranked, ...rest].map(([name, steps], i) => {
     const cells = STEP_COLS.map(([k]) => {
       const st = steps[k] || { status: "pending" };
@@ -1286,10 +1302,12 @@ function renderBatch(cur) {
                                                          ["done", "skipped"].includes(steps[k].status));
     const load = loadable ? `<button type="button" data-load="0" data-demo="${esc(name)}">Row 1</button>
       <button type="button" data-load="1" data-demo="${esc(name)}">Row 2</button>` : "";
-    const mean = meanOf(steps);
-    const rank = mean != null ? i + 1 : "";
-    return `<tr><td>${rank}</td><td>${esc(name)}</td>${cells}<td>${load}</td>` +
-      `<td class="num">${mean != null ? mean.toFixed(2) : "–"}</td></tr>`;
+    const rank = statOf(steps, by) != null ? i + 1 : "";
+    const stats = BATCH_STATS.map(([k, , d]) => {
+      const v = statOf(steps, k);
+      return `<td class="num${k === by ? " sorted" : ""}">${v != null ? v.toFixed(d) : "–"}</td>`;
+    }).join("");
+    return `<tr><td>${rank}</td><td>${esc(name)}</td>${cells}<td>${load}</td>${stats}</tr>`;
   }).join("");
   table.innerHTML = head + rows;
   table.dataset.progress = JSON.stringify(p.demos);
@@ -1315,6 +1333,10 @@ $("#batch-cancel").onclick = async () => {
   try { await postJSON("/api/batch/cancel", {}); refreshBatch(); } catch (err) { toast(err.message); }
 };
 $("#batch-browse").onclick = () => openPicker(null, (dir) => { $("#batch-root").value = dir; scanBatch(); }, "dir");
+$("#batch-rank").addEventListener("change", (e) => {
+  try { localStorage.setItem("cotracker-gui.rankBy", e.target.value); } catch { /* per-page only */ }
+  renderBatch(lastBatch);
+});
 $("#batch-table").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-load]");
   if (!btn) return;

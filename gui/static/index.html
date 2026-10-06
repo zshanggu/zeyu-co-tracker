@@ -86,7 +86,19 @@
       <details open><summary>Compare</summary><div id="batch-compare" class="fields"></div></details>
       <label class="batch-skip"><input type="checkbox" id="batch-skip"> Skip steps whose output already exists (resume an interrupted batch)</label>
       <div id="batch-progress" hidden>
-        <h3>Progress <span id="batch-state"></span></h3>
+        <div class="batch-progress-head">
+          <h3>Progress <span id="batch-state"></span></h3>
+          <span class="spacer"></span>
+          <label>Rank by
+            <select id="batch-rank">
+              <option value="overall_mean">overall mean</option>
+              <option value="overall_median">overall median</option>
+              <option value="auc_mean">AUC mean</option>
+              <option value="auc_median">AUC median</option>
+            </select>
+            <span class="hint">(low → high)</span>
+          </label>
+        </div>
         <div class="batch-table-wrap"><table id="batch-table"></table></div>
         <pre id="batch-log"></pre>
       </div>
