@@ -235,7 +235,12 @@ dialog#batch { width: min(1000px, 96vw); }
 .batch-suffixes input { width: 80px; font: inherit; padding: 0 3px; }
 .batch-scan { color: var(--muted); max-height: 140px; overflow: auto; }
 .batch-scan .missing { color: var(--danger); }
-.batch-skip { display: flex; gap: 6px; align-items: center; }
+.batch-steps { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
+.batch-steps legend { padding: 0 4px; font-weight: 600; }
+.batch-step-modes { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center; }
+.batch-step-modes label { display: flex; gap: 6px; align-items: center; }
+.batch-presets { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
+.batch-steps .hint { margin: 8px 0 0; font-size: 0.9em; }
 .batch-table-wrap { max-height: 40vh; overflow: auto; border: 1px solid var(--border); border-radius: 6px; }
 #batch-table { border-collapse: collapse; width: 100%; font-size: 12px; }
 #batch-table th, #batch-table td { padding: 3px 8px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
@@ -244,7 +249,10 @@ dialog#batch { width: min(1000px, 96vw); }
 .st.done, .st.skipped { color: var(--ok); border-color: var(--ok); }
 .st.running { color: var(--accent); border-color: var(--accent); }
 .st.failed, .st.missing { color: var(--danger); border-color: var(--danger); }
-.st.pending { color: var(--muted); }
+.st.pending, .st.off { color: var(--muted); }
+.vlm-q { max-width: 9em; overflow-wrap: anywhere; font-size: 0.85em; }
+.vlm-a { text-align: center; cursor: help; }
+.vlm-a.yes { color: var(--danger); font-weight: 600; }
 #batch-log { max-height: 120px; overflow: auto; background: var(--bg); padding: 6px; border-radius: 6px;
   font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; margin: 0; }
 #batch-msg { color: var(--muted); }

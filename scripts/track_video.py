@@ -163,6 +163,12 @@ def main():
     if args.mode == "online" and args.backward_tracking:
         print("warning: --backward_tracking is ignored in online mode")
     ckpt = args.checkpoint or f"./checkpoints/scaled_{args.mode}.pth"
+    if not args.checkpoint and not os.path.isfile(ckpt):
+        # The default CoTracker3 weights are not in git: fetch them once (README: "checkpoints" section).
+        url = f"https://huggingface.co/facebook/cotracker3/resolve/main/scaled_{args.mode}.pth"
+        print(f"downloading {url} -> {ckpt}", flush=True)
+        os.makedirs(os.path.dirname(ckpt), exist_ok=True)
+        torch.hub.download_url_to_file(url, ckpt)
     if not torch.cuda.is_available():
         devices = ["cpu"]
     elif args.gpus == "all":

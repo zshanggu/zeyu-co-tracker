@@ -1183,13 +1183,27 @@ const BATCH_MASK_FIELDS = [
   { key: "open", label: "Open kernel (px)", type: "number", min: 0 },
 ];
 const BATCH_COMPARE_FIELDS = COMPARE_FIELDS.filter((f) => f.key !== "mask");
+const BATCH_VLM_FIELDS = [
+  { key: "questions", label: "Questions file", type: "text",
+    help: "JSON list of {id, question} Y/N questions (path relative to the repo, or absolute). " +
+          "Empty: scripts/vlm_questions.json." },
+  { key: "model", label: "Model", type: "text",
+    help: "Hugging Face id; weights in checkpoints/vlm/ (downloaded there on first use)." },
+  { key: "min_free_gb", label: "Min free GPU memory (GB)", type: "number", min: 0,
+    help: "Runs on each demo right after its comparison. The model is loaded once, on the tracking GPU " +
+          "(above) with the most free memory, and stays there for the batch; on the CPU when none of them " +
+          "has this much free, or no GPU is selected (the 3B model needs ~8 GB)." },
+  { key: "max_new_tokens", label: "Max new tokens", type: "number", min: 64 },
+];
 const BATCH_DEFAULTS = () => ({
   track: Object.fromEntries(BATCH_TRACK_FIELDS.map((f) => [f.key, structuredClone(TRACK_DEFAULTS[f.key])])),
   mask: { colors: "167,18,135", tolerance: 30, cleanup: true, close: 5, open: 3 },
   compare: { ...Object.fromEntries(BATCH_COMPARE_FIELDS.map((f) => [f.key, COMPARE_DEFAULTS[f.key]])),
              direction: "B vs A" },
+  vlm: { questions: "", model: "Qwen/Qwen2.5-VL-3B-Instruct", min_free_gb: 10, max_new_tokens: 512 },
 });
-const STEP_COLS = [["track_a", "Track A"], ["track_b", "Track B"], ["mask", "Mask"], ["compare", "Compare"]];
+const STEP_COLS = [["track_a", "Track A"], ["track_b", "Track B"], ["mask", "Mask"], ["compare", "Compare"],
+                   ["vlm", "VLM"]];
 let batchPoll = null;
 
 function readFields(box, fields, obj) {
@@ -1223,18 +1237,19 @@ async function openBatch() {
   const cur = (await api("/api/batch")).batch;
   const cfg = BATCH_DEFAULTS();
   if (cur && cur.config) {  // prefill with the last batch's settings
-    for (const k of ["track", "mask", "compare"]) Object.assign(cfg[k], cur.config[k] || {});
+    for (const k of ["track", "mask", "compare", "vlm"]) Object.assign(cfg[k], cur.config[k] || {});
     $("#batch-root").value = cur.config.root || "";
     $("#batch-a").value = cur.config.a_suffix ?? "_source";
     $("#batch-b").value = cur.config.b_suffix ?? "_01";
     $("#batch-i").value = cur.config.instance_suffix ?? "_instance";
-    $("#batch-skip").checked = !!cur.config.skip_existing;
+    setStepModes(stepModesOf(cur.config));
   } else if (!$("#batch-root").value) {
     $("#batch-root").value = "source_video/not_reviewed";
   }
   await fillFields($("#batch-track"), BATCH_TRACK_FIELDS, cfg.track);
   await fillFields($("#batch-mask"), BATCH_MASK_FIELDS, cfg.mask);
   await fillFields($("#batch-compare"), BATCH_COMPARE_FIELDS, cfg.compare);
+  await fillFields($("#batch-vlm"), BATCH_VLM_FIELDS, cfg.vlm);
   $("#batch-msg").textContent = "";
   $("#batch-scan-result").textContent = "";
   renderBatch(cur);
@@ -1296,10 +1311,13 @@ async function startBatch() {
   const mask = num(readFields($("#batch-mask"), BATCH_MASK_FIELDS, {}), ["tolerance", "open", "close"]);
   const compare = num(readFields($("#batch-compare"), BATCH_COMPARE_FIELDS, {}), ["radius", "mask_step"]);
   compare.vmax = compare.vmax === "" ? null : Number(compare.vmax);
+  const vlm = num(readFields($("#batch-vlm"), BATCH_VLM_FIELDS, {}), ["min_free_gb", "max_new_tokens"]);
+  const steps = getStepModes();
+  if (Object.values(steps).every((m) => m === "off")) return toast("All steps are off.");
   try {
     await postJSON("/api/batch/start", {
       root: $("#batch-root").value.trim(), a_suffix: $("#batch-a").value, b_suffix: $("#batch-b").value,
-      instance_suffix: $("#batch-i").value, skip_existing: $("#batch-skip").checked, track, mask, compare,
+      instance_suffix: $("#batch-i").value, steps, track, vlm, mask, compare,
     });
     $("#batch-msg").textContent = `Batch started: ${scan.demos.length} demos.`;
     refreshBatch();
@@ -1337,14 +1355,21 @@ function renderBatch(cur) {
   if (!p) { table.innerHTML = "<tr><td>Starting…</td></tr>"; return; }
   const by = rankStat();
   $("#batch-rank").value = by;
+  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const sortedTh = (k, label) => `<th class="num${k === by ? " sorted" : ""}">${label}${k === by ? " ▲" : ""}</th>`;
+  // VLM check columns: one Y/N per question (hover: the model's reason), then the anomaly score.
+  const questions = cur.vlm_questions || [];
   const head = "<tr><th>Rank</th><th>Demo</th>" + STEP_COLS.map(([, l]) => `<th>${l}</th>`).join("") +
     "<th>Load into grid</th>" +
-    BATCH_STATS.map(([k, l]) => `<th class="num${k === by ? " sorted" : ""}">${l}${k === by ? " ▲" : ""}</th>`).join("") +
-    "</tr>";
-  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  // Compared demos first, ranked by the selected statistic (low = most similar); the rest
-  // (pending, running, failed, or without that statistic) after them in folder order.
-  const statOf = (steps, k) => (steps.compare && steps.compare[k] != null ? steps.compare[k] : null);
+    BATCH_STATS.map(([k, l]) => sortedTh(k, l)).join("") +
+    questions.map((q) => `<th class="vlm-q" title="${esc(q.question)}">${esc(q.id)}</th>`).join("") +
+    sortedTh("vlm_score", "VLM score") + "</tr>";
+  // Demos with the selected statistic first, ranked low to high (low = most similar / fewest
+  // issues found); the rest (pending, running, failed, or without it) after them in folder order.
+  const statOf = (steps, k) => {
+    const src = k === "vlm_score" ? steps.vlm : steps.compare;
+    return src && src[k] != null ? src[k] : null;
+  };
   const entries = Object.entries(p.demos);
   const ranked = entries.filter(([, st]) => statOf(st, by) != null).sort((a, b) => statOf(a[1], by) - statOf(b[1], by));
   const rest = entries.filter(([, st]) => statOf(st, by) == null);
@@ -1363,7 +1388,14 @@ function renderBatch(cur) {
     const stats = BATCH_STATS.map(([k, , d]) => {
       const v = statOf(steps, k);
       return `<td class="num${k === by ? " sorted" : ""}">${v != null ? v.toFixed(d) : "–"}</td>`;
-    }).join("");
+    }).join("") + questions.map((q) => {
+      const a = ((steps.vlm || {}).answers || {})[q.id];
+      return a ? `<td class="vlm-a ${a.answer === "Y" ? "yes" : "no"}" title="${esc(a.reason || "")}">${esc(a.answer)}</td>`
+               : "<td>–</td>";
+    }).join("") + (() => {
+      const v = statOf(steps, "vlm_score");
+      return `<td class="num${by === "vlm_score" ? " sorted" : ""}">${v != null ? v.toFixed(2) : "–"}</td>`;
+    })();
     return `<tr><td>${rank}</td><td>${esc(name)}</td>${cells}<td>${load}</td>${stats}</tr>`;
   }).join("");
   table.innerHTML = head + rows;
@@ -1401,6 +1433,38 @@ $("#batch-table").addEventListener("click", (e) => {
   loadDemo(Number(btn.dataset.load), demos[btn.dataset.demo] || {}).catch((err) => toast(err.message));
 });
 $("#batch").addEventListener("close", () => clearInterval(batchPoll));
+// Batch steps: one mode per step (run / missing / off), see scripts/batch_pipeline.py.
+const BATCH_STEPS = STEP_COLS;
+const STEP_PRESETS = {
+  all: { track_a: "run", track_b: "run", mask: "run", compare: "run", vlm: "run" },
+  resume: { track_a: "missing", track_b: "missing", mask: "missing", compare: "missing", vlm: "missing" },
+  recompare: { track_a: "missing", track_b: "missing", mask: "run", compare: "run", vlm: "missing" },
+  source: { track_a: "missing", track_b: "off", mask: "off", compare: "off", vlm: "off" },
+  vlm: { track_a: "off", track_b: "off", mask: "off", compare: "off", vlm: "run" },
+};
+$("#batch-steps .batch-step-modes").innerHTML = BATCH_STEPS.map(([k, label]) => `<label>${label}
+  <select data-step="${k}"><option value="run">Run</option><option value="missing">If missing</option>
+  <option value="off">Off</option></select></label>`).join("");
+function setStepModes(modes) {
+  for (const sel of $("#batch-steps").querySelectorAll("select")) sel.value = modes[sel.dataset.step] || "run";
+}
+function getStepModes() {
+  return Object.fromEntries([...$("#batch-steps").querySelectorAll("select")].map((s) => [s.dataset.step, s.value]));
+}
+// Settings of an earlier batch, including ones saved with the older skip_existing / skip_tracking keys.
+function stepModesOf(cfg) {
+  const steps = cfg.steps;
+  const modes = Object.fromEntries(BATCH_STEPS.map(([k]) => [k,
+    Array.isArray(steps) ? (steps.includes(k) ? "run" : "off") : ((steps || {})[k] || "run")]));
+  for (const [k] of BATCH_STEPS) {
+    if (modes[k] === "run" && (cfg.skip_existing || (cfg.skip_tracking && k.startsWith("track")))) modes[k] = "missing";
+  }
+  return modes;
+}
+$("#batch-steps .batch-presets").addEventListener("click", (e) => {
+  const p = e.target.dataset && e.target.dataset.preset;
+  if (p) setStepModes(STEP_PRESETS[p]);
+});
 $("#picker-use-dir").onclick = () => {
   if (!pickerData.dir) return toast("Open a folder first.");
   rememberDir(pickerData.dir);

@@ -84,7 +84,20 @@
       <details open><summary>Tracking (videos A and B)</summary><div id="batch-track" class="fields"></div></details>
       <details open><summary>Mask extraction (instance video)</summary><div id="batch-mask" class="fields"></div></details>
       <details open><summary>Compare</summary><div id="batch-compare" class="fields"></div></details>
-      <label class="batch-skip"><input type="checkbox" id="batch-skip"> Skip steps whose output already exists (resume an interrupted batch)</label>
+      <details open><summary>VLM check (video B)</summary><div id="batch-vlm" class="fields"></div></details>
+      <fieldset id="batch-steps" class="batch-steps">
+        <legend>Steps</legend>
+        <div class="batch-step-modes"></div>
+        <div class="batch-presets">Presets:
+          <button type="button" data-preset="all">Run all</button>
+          <button type="button" data-preset="resume">Resume (only missing)</button>
+          <button type="button" data-preset="recompare">Redo mask + compare</button>
+          <button type="button" data-preset="source">Track sources only</button>
+          <button type="button" data-preset="vlm">VLM check only</button>
+        </div>
+        <p class="hint"><b>Run</b>: always, replacing an existing output. <b>If missing</b>: only where the output
+          doesn't exist yet. <b>Off</b>: not run; an existing output is kept and used by the later steps.</p>
+      </fieldset>
       <div id="batch-progress" hidden>
         <div class="batch-progress-head">
           <h3>Progress <span id="batch-state"></span></h3>
@@ -95,6 +108,7 @@
               <option value="overall_median">overall median</option>
               <option value="auc_mean">AUC mean</option>
               <option value="auc_median">AUC median</option>
+              <option value="vlm_score">VLM anomaly score</option>
             </select>
             <span class="hint">(low → high)</span>
           </label>

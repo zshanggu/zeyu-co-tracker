@@ -1,0 +1,11 @@
+[
+  {
+    "id": "different_table_ground_texture",
+    "question": "Among these three frames, is there different table/ground texture in both camera views that appear in any frame, Y/N?"
+  },
+  {
+    "id": "strange_human_hand",
+    "question": "Among these three frames, does a strange human hand appear in any frame, Y/N?"
+  }
+]
+

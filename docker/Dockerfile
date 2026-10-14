@@ -17,6 +17,11 @@ RUN pip install --no-cache-dir \
         opencv-python-headless mediapy einops \
         fastapi "uvicorn[standard]" python-multipart
 
+# Qwen2.5-VL for the batch's VLM quality check (scripts/vlm_check.py). torch is pinned so pip never swaps the image's CUDA 12.4 build, and
+# transformers 5 needs torch >= 2.5.
+RUN pip install --no-cache-dir "torch==2.4.1" \
+        "transformers>=4.49,<5" accelerate "qwen-vl-utils>=0.0.8"
+
 # The repo itself is bind-mounted at /workspace at runtime (see docker/run.sh),
 # so code edits on the host are picked up without rebuilding.
 ENV PYTHONPATH=/workspace

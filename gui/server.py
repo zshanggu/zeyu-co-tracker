@@ -546,10 +546,11 @@ class BatchReq(BaseModel):
     a_suffix: str = "_source"
     b_suffix: str = "_01"
     instance_suffix: str = "_instance"
-    skip_existing: bool = False
+    steps: dict[str, str] = {"track_a": "run", "track_b": "run", "mask": "run", "compare": "run", "vlm": "run"}
     track: dict = {}
     mask: dict = {}
     compare: dict = {}
+    vlm: dict = {}
 
 
 def batch_out(root: Path) -> Path:
@@ -591,6 +592,16 @@ def current_batch():
                     c[k] = sm.get(k)
             except (OSError, ValueError):
                 pass
+        # VLM check of video B (<demo>_vlm.json): anomaly score and the Y/N answer to each question.
+        v = steps.get("vlm") or {}
+        if v.get("path") and v.get("status") in ("done", "skipped"):
+            try:
+                res = json.load(open(REPO / v["path"]))
+                v["vlm_score"] = res.get("score")
+                v["answers"] = res.get("answers")
+                info.setdefault("vlm_questions", res.get("questions"))
+            except (OSError, ValueError):
+                pass
     if info["job_status"] == "lost" and info["progress"] and info["progress"].get("finished"):
         info["job_status"] = "done"  # finished before the restart
     info["tail"] = read_tail(REPO / info["out"] / "job.log", 15)
@@ -610,6 +621,11 @@ def batch_start(r: BatchReq):
     root = resolve(r.root)
     if not root.is_dir():
         raise HTTPException(404, f"folder not found: {r.root}")
+    steps = ("track_a", "track_b", "mask", "compare", "vlm")
+    if set(r.steps) - set(steps) or set(r.steps.values()) - {"run", "missing", "off"}:
+        raise HTTPException(400, "steps: {track_a|track_b|mask|compare|vlm: run|missing|off}")
+    if all(r.steps.get(k, "run") == "off" for k in steps):
+        raise HTTPException(400, "all steps are off")
     out = batch_out(root)
     out.mkdir(parents=True, exist_ok=True)
     cfg = dict(r.model_dump(), root=rel(root), out=rel(out))
