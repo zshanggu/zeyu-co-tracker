@@ -592,14 +592,16 @@ def current_batch():
                     c[k] = sm.get(k)
             except (OSError, ValueError):
                 pass
-        # VLM check of video B (<demo>_vlm.json): anomaly score and the Y/N answer to each question.
+        # VLM check of video B (<demo>_vlm.json): anomaly score and each question's P(yes) / Y/N answer.
         v = steps.get("vlm") or {}
         if v.get("path") and v.get("status") in ("done", "skipped"):
             try:
                 res = json.load(open(REPO / v["path"]))
                 v["vlm_score"] = res.get("score")
                 v["answers"] = res.get("answers")
-                info.setdefault("vlm_questions", res.get("questions"))
+                # one column per question id, over all results (older ones may have other questions)
+                known = {q["id"] for q in info.setdefault("vlm_questions", [])}
+                info["vlm_questions"] += [q for q in res.get("questions") or [] if q["id"] not in known]
             except (OSError, ValueError):
                 pass
     if info["job_status"] == "lost" and info["progress"] and info["progress"].get("finished"):
@@ -629,13 +631,14 @@ def batch_start(r: BatchReq):
     out = batch_out(root)
     out.mkdir(parents=True, exist_ok=True)
     cfg = dict(r.model_dump(), root=rel(root), out=rel(out))
-    if cfg["mask"].get("colors"):
-        try:
-            sys.path.insert(0, str(REPO / "scripts"))
-            from extract_mask import parse_colors
-            parse_colors(cfg["mask"]["colors"])
-        except ValueError as e:
-            raise HTTPException(400, str(e))
+    sys.path.insert(0, str(REPO / "scripts"))
+    from extract_mask import parse_colors
+    for key, spec in (("mask colors", cfg["mask"].get("colors")), ("towel color", cfg["vlm"].get("towel_color"))):
+        if spec:
+            try:
+                parse_colors(spec)
+            except ValueError as e:
+                raise HTTPException(400, f"{key}: {e}")
     with open(out / "batch_config.json", "w") as f:
         json.dump(cfg, f, indent=2)
     (out / "batch_status.json").unlink(missing_ok=True)  # don't show the previous run's progress

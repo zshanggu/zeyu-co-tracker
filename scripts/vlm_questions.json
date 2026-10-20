@@ -1,11 +1,16 @@
 [
   {
-    "id": "different_table_ground_texture",
-    "question": "Among these three frames, is there different table/ground texture in both camera views that appear in any frame, Y/N?"
+    "id": "towel_patch",
+    "view": "room_towel",
+    "at": [0.55, 0.7, 0.85, 1.0],
+    "threshold": 0.05,
+    "question": "These are close-up frames of a towel being folded by a robot. Is there a patch, spot or area on the towel with a different color, for example white, gray or a much darker color?"
   },
   {
-    "id": "strange_human_hand",
-    "question": "Among these three frames, does a strange human hand appear in any frame, Y/N?"
+    "id": "room_smear",
+    "view": "room",
+    "at": [0.0, 0.33, 0.67, 1.0],
+    "threshold": 0.3,
+    "question": "Is there a dark smudge, a blurry blob or a smeared area anywhere in these images?"
   }
 ]
-

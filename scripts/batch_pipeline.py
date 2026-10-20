@@ -10,8 +10,8 @@ Output layout (mirrors the input):
     <out>/demo_XXX/demo_XXX_01/              tracking result of B
     <out>/demo_XXX/demo_XXX_instance_mask.npy
     <out>/demo_XXX/<first>_vs_<second>/      comparison (compare.mp4, per_frame.csv, ...)
-    <out>/demo_XXX/demo_XXX_01_vlm.json      VLM check of video B (answers, anomaly score)
-    <out>/demo_XXX/vlm_frames/               the first / middle / final frames it was shown
+    <out>/demo_XXX/demo_XXX_01_vlm.json      VLM check of video B (P(yes) per question, anomaly score)
+    <out>/demo_XXX/vlm_frames/               the images each question was asked with
     <out>/demo_XXX/*.log                     one log per step
     <out>/batch_status.json                  progress of every demo / step (read by the GUI)
 
@@ -19,10 +19,11 @@ All settings come from a JSON config (the GUI writes <out>/batch_config.json):
     python scripts/batch_pipeline.py --config outputs/gui/not_reviewed/batch_config.json
 See DEFAULTS below for the keys.
 
-The VLM check (scripts/vlm_check.py) runs on video B: its first, middle and final frames go to a local
-Qwen2.5-VL model (weights in checkpoints/vlm/) with the Y/N questions of "vlm.questions" (default
-scripts/vlm_questions.json), and every Y adds 1/M to the anomaly score (0 = no issue found, 1 = all
-issues found).
+The VLM check (scripts/vlm_check.py) runs on video B: each question of "vlm.questions" (default
+scripts/vlm_questions.json) is asked on its own, with its own frames and view (a towel close-up uses the
+instance video and "vlm.towel_color"), to a local Qwen2.5-VL model (weights in checkpoints/vlm/). A
+question is flagged when the model's P(yes) is above its threshold, and every flag adds 1/M to the
+anomaly score (0 = no issue found, 1 = all issues found).
 It runs on each demo right after its comparison. The model is loaded once, at the first video that
 needs it, and stays loaded for the rest of the batch, on the tracking GPU ("track.gpus") with the most
 free memory if at least "vlm.min_free_gb" are free there, and on the CPU otherwise (or when no GPU is
@@ -64,8 +65,8 @@ DEFAULTS = {
     "mask": {"colors": "167,18,135", "tolerance": 30, "cleanup": True, "open": 3, "close": 5},
     "compare": {"direction": "B vs A", "view": "pairs", "metric": "position", "time": "truncate",
                 "radius": 2, "vmax": None, "mask_step": 5, "mask_rule": "both"},
-    "vlm": {"questions": "", "model": "Qwen/Qwen2.5-VL-3B-Instruct",
-            "min_free_gb": 10, "max_new_tokens": 512},
+    "vlm": {"questions": "", "model": "Qwen/Qwen2.5-VL-7B-Instruct", "min_free_gb": 18,
+            "towel_color": "167,18,135"},
 }
 STEPS = ("track_a", "track_b", "mask", "compare", "vlm")
 MODES = ("run", "missing", "off")
@@ -300,6 +301,7 @@ class VlmCheck:
         if self.mode == "missing" and result.is_file():
             status.set(name, "vlm", "skipped", path=rel(result), note="already done")
             return
+        instance = demo_dir / f"{name}{self.cfg['instance_suffix']}.mp4"
         if self.model is None and self.error is None:
             try:
                 self.load()
@@ -315,12 +317,15 @@ class VlmCheck:
 
         v = self.v
         try:
-            frames = vlm_check.extract_frames(video, out_dir / "vlm_frames")
-            answers = self.model.ask(frames, self.questions, int(v["max_new_tokens"]))
+            towel = parse_colors(v.get("towel_color") or "167,18,135")[0]
+            images = vlm_check.question_images(video, self.questions, out_dir / "vlm_frames",
+                                               instance if instance.is_file() else None, towel)
+            answers = self.model.ask(images, self.questions)
             score = vlm_check.anomaly_score(answers)
-            record = {"video": str(video), "model": v["model"], "device": self.where, "score": score,
-                      "questions": [{"id": q.id, "question": q.text} for q in self.questions],
-                      "answers": answers, "frames": {k: rel(p) for k, p in frames.items()}}
+            record = {"video": str(video), "instance": str(instance) if instance.is_file() else None,
+                      "model": v["model"], "device": self.where, "score": score,
+                      "questions": [q.to_json() for q in self.questions],
+                      "answers": answers, "frames": {k: [rel(p) for p in ps] for k, ps in images.items()}}
             result.write_text(json.dumps(record, indent=1))
             status.set(name, "vlm", "done", path=rel(result), seconds=round(time.time() - t0, 1),
                        note=f"anomaly score {score:.2f} ({self.where})")

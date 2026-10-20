@@ -1185,22 +1185,27 @@ const BATCH_MASK_FIELDS = [
 const BATCH_COMPARE_FIELDS = COMPARE_FIELDS.filter((f) => f.key !== "mask");
 const BATCH_VLM_FIELDS = [
   { key: "questions", label: "Questions file", type: "text",
-    help: "JSON list of {id, question} Y/N questions (path relative to the repo, or absolute). " +
-          "Empty: scripts/vlm_questions.json." },
-  { key: "model", label: "Model", type: "text",
-    help: "Hugging Face id; weights in checkpoints/vlm/ (downloaded there on first use)." },
+    help: "JSON list of {id, question, view, at, threshold} (path relative to the repo, or absolute; " +
+          "see scripts/vlm_check.py). Each question is asked on its own and flagged when the model's " +
+          "P(yes) is above its threshold. Empty: scripts/vlm_questions.json." },
+  { key: "model", label: "Model", type: "select",
+    options: [["Qwen/Qwen2.5-VL-7B-Instruct", "Qwen2.5-VL-7B (thresholds tuned for it)"],
+              ["Qwen/Qwen2.5-VL-3B-Instruct", "Qwen2.5-VL-3B (weaker)"]],
+    help: "Weights in checkpoints/vlm/ (downloaded there on first use). The default questions' thresholds " +
+          "were tuned for the 7B model." },
+  { key: "towel_color", label: "Towel color (instance video)", type: "text",
+    help: "R,G,B of the towel in the instance video, for the towel close-ups (room_towel / wrist_towel views)." },
   { key: "min_free_gb", label: "Min free GPU memory (GB)", type: "number", min: 0,
     help: "Runs on each demo right after its comparison. The model is loaded once, on the tracking GPU " +
           "(above) with the most free memory, and stays there for the batch; on the CPU when none of them " +
-          "has this much free, or no GPU is selected (the 3B model needs ~8 GB)." },
-  { key: "max_new_tokens", label: "Max new tokens", type: "number", min: 64 },
+          "has this much free, or no GPU is selected (7B needs ~17 GB, 3B ~8 GB)." },
 ];
 const BATCH_DEFAULTS = () => ({
   track: Object.fromEntries(BATCH_TRACK_FIELDS.map((f) => [f.key, structuredClone(TRACK_DEFAULTS[f.key])])),
   mask: { colors: "167,18,135", tolerance: 30, cleanup: true, close: 5, open: 3 },
   compare: { ...Object.fromEntries(BATCH_COMPARE_FIELDS.map((f) => [f.key, COMPARE_DEFAULTS[f.key]])),
              direction: "B vs A" },
-  vlm: { questions: "", model: "Qwen/Qwen2.5-VL-3B-Instruct", min_free_gb: 10, max_new_tokens: 512 },
+  vlm: { questions: "", model: "Qwen/Qwen2.5-VL-7B-Instruct", towel_color: "167,18,135", min_free_gb: 18 },
 });
 const STEP_COLS = [["track_a", "Track A"], ["track_b", "Track B"], ["mask", "Mask"], ["compare", "Compare"],
                    ["vlm", "VLM"]];
@@ -1238,6 +1243,10 @@ async function openBatch() {
   const cfg = BATCH_DEFAULTS();
   if (cur && cur.config) {  // prefill with the last batch's settings
     for (const k of ["track", "mask", "compare", "vlm"]) Object.assign(cfg[k], cur.config[k] || {});
+    if (!("towel_color" in (cur.config.vlm || {}))) {
+      // A batch from before the P(yes) questions: its 3B model / memory settings are not restored.
+      Object.assign(cfg.vlm, { model: BATCH_DEFAULTS().vlm.model, min_free_gb: BATCH_DEFAULTS().vlm.min_free_gb });
+    }
     $("#batch-root").value = cur.config.root || "";
     $("#batch-a").value = cur.config.a_suffix ?? "_source";
     $("#batch-b").value = cur.config.b_suffix ?? "_01";
@@ -1311,7 +1320,7 @@ async function startBatch() {
   const mask = num(readFields($("#batch-mask"), BATCH_MASK_FIELDS, {}), ["tolerance", "open", "close"]);
   const compare = num(readFields($("#batch-compare"), BATCH_COMPARE_FIELDS, {}), ["radius", "mask_step"]);
   compare.vmax = compare.vmax === "" ? null : Number(compare.vmax);
-  const vlm = num(readFields($("#batch-vlm"), BATCH_VLM_FIELDS, {}), ["min_free_gb", "max_new_tokens"]);
+  const vlm = num(readFields($("#batch-vlm"), BATCH_VLM_FIELDS, {}), ["min_free_gb"]);
   const steps = getStepModes();
   if (Object.values(steps).every((m) => m === "off")) return toast("All steps are off.");
   try {
@@ -1357,12 +1366,17 @@ function renderBatch(cur) {
   $("#batch-rank").value = by;
   const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const sortedTh = (k, label) => `<th class="num${k === by ? " sorted" : ""}">${label}${k === by ? " ▲" : ""}</th>`;
-  // VLM check columns: one Y/N per question (hover: the model's reason), then the anomaly score.
+  // VLM check columns: one per question (P(yes), red when above its threshold; older results: Y/N and
+  // the model's reason on hover), then the anomaly score.
   const questions = cur.vlm_questions || [];
   const head = "<tr><th>Rank</th><th>Demo</th>" + STEP_COLS.map(([, l]) => `<th>${l}</th>`).join("") +
     "<th>Load into grid</th>" +
     BATCH_STATS.map(([k, l]) => sortedTh(k, l)).join("") +
-    questions.map((q) => `<th class="vlm-q" title="${esc(q.question)}">${esc(q.id)}</th>`).join("") +
+    questions.map((q) => {
+      const tip = q.question + (q.view ? `\n\nview: ${q.view}, frames at ${(q.at || []).join(", ")}, ` +
+                                         `flag when P(yes) > ${q.threshold}` : "");
+      return `<th class="vlm-q" title="${esc(tip)}">${esc(q.id)}</th>`;
+    }).join("") +
     sortedTh("vlm_score", "VLM score") + "</tr>";
   // Demos with the selected statistic first, ranked low to high (low = most similar / fewest
   // issues found); the rest (pending, running, failed, or without it) after them in folder order.
@@ -1390,8 +1404,11 @@ function renderBatch(cur) {
       return `<td class="num${k === by ? " sorted" : ""}">${v != null ? v.toFixed(d) : "–"}</td>`;
     }).join("") + questions.map((q) => {
       const a = ((steps.vlm || {}).answers || {})[q.id];
-      return a ? `<td class="vlm-a ${a.answer === "Y" ? "yes" : "no"}" title="${esc(a.reason || "")}">${esc(a.answer)}</td>`
-               : "<td>–</td>";
+      if (!a) return "<td>–</td>";
+      const cls = `vlm-a ${a.answer === "Y" ? "yes" : "no"}`;
+      return a.p_yes != null
+        ? `<td class="${cls} num" title="P(yes) ${a.p_yes}, flagged above ${a.threshold}">${a.p_yes.toFixed(3)}</td>`
+        : `<td class="${cls}" title="${esc(a.reason || "")}">${esc(a.answer)}</td>`;
     }).join("") + (() => {
       const v = statOf(steps, "vlm_score");
       return `<td class="num${by === "vlm_score" ? " sorted" : ""}">${v != null ? v.toFixed(2) : "–"}</td>`;
