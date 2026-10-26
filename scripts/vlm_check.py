@@ -155,8 +155,11 @@ def frame_indexes(question: Question, count: int) -> list[int]:
 
 
 def towel_box(instance: np.ndarray, color, tolerance=40, pad=0.25):
-    """Square (x0, y0, x1, y1) around the towel pixels of an instance image, or None without a towel."""
-    mask = np.abs(instance.astype(int) - np.asarray(color)).sum(-1) < tolerance
+    """Square (x0, y0, x1, y1) around the towel pixels of an instance image, or None without a towel.
+    color: one (R, G, B) or a list of them; a pixel close to any of them is a towel pixel (the instance
+    color of the towel can differ from video to video)."""
+    colors = np.asarray(color).reshape(-1, 3)
+    mask = (np.abs(instance.astype(int)[..., None, :] - colors).sum(-1) < tolerance).any(-1)
     if mask.sum() < 50:
         return None
     ys, xs = np.nonzero(mask)
