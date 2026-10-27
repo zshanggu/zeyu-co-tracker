@@ -11,17 +11,20 @@ found, 1 = every issue found). The batch pipeline runs it on video B of every de
 Questions: a JSON list (default scripts/vlm_questions.json) of
     {"id": "towel_patch",            letters, digits and underscores; the column name in the GUI table
      "question": "...",              asked as "<question> Answer Yes or No."
-     "view": "room_towel",           what the model sees, default "both":
-                                       both         the whole frame (room and wrist camera side by side)
-                                       room, wrist  the left (room) / right (wrist) half of the frame
-                                       room_towel, wrist_towel
-                                                    a square close-up of the towel in that half, found
+     "view": "third_person_view_object",  what the model sees, default "both_views":
+                                       both_views   the whole frame (third-person and wrist view side by side)
+                                       third_person_view, wrist_view
+                                                    the left (third-person) / right (wrist) half of the frame
+                                       third_person_view_object, wrist_view_object
+                                                    a square close-up of the object in that half, found
                                                     with the instance video (towel_color); the whole
-                                                    half when there is no instance video or no towel
+                                                    half when there is no instance video or no object
+                                     The old names both, room, wrist, room_towel and wrist_towel are still
+                                     accepted and mean the same views.
      "at": [0.55, 0.7, 0.85, 1.0],   which frames, as fractions of the video (0 = first, 1 = last),
                                      default [0, 0.5, 1]
      "threshold": 0.05}              flag when P(yes) > threshold, default 0.5
-The view names assume the 1024x512 Cosmos layout: room camera left, wrist camera right.
+The view names assume the Cosmos split-screen layout: third-person view left, wrist view right.
 The thresholds of the default questions were tuned with Qwen2.5-VL-7B on 240 reviewed O/X videos
 (franka_towel_n750_seeds1234); another model needs other thresholds.
 
@@ -49,7 +52,9 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 DEFAULT_QUESTIONS = REPO / "scripts" / "vlm_questions.json"
 MODEL_CACHE = REPO / "checkpoints" / "vlm"
 QUESTION_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-VIEWS = ("both", "room", "wrist", "room_towel", "wrist_towel")
+VIEWS = ("both_views", "third_person_view", "wrist_view", "third_person_view_object", "wrist_view_object")
+VIEW_ALIASES = {"both": "both_views", "room": "third_person_view", "wrist": "wrist_view",
+                "room_towel": "third_person_view_object", "wrist_towel": "wrist_view_object"}  # old names
 TOWEL_COLOR = (167, 18, 135)  # the towel in the SoftMimicGen instance videos
 CROP_SIZE = 448  # side of a towel close-up, px
 
@@ -58,7 +63,7 @@ CROP_SIZE = 448  # side of a towel close-up, px
 class Question:
     id: str
     text: str
-    view: str = "both"
+    view: str = "both_views"
     at: tuple[float, ...] = (0.0, 0.5, 1.0)
     threshold: float = 0.5
 
@@ -86,7 +91,8 @@ def load_questions(path: Path) -> list[Question]:
             raise ValueError(f"Duplicate question id: {question_id}")
         if not isinstance(text, str) or not text.strip():
             raise ValueError(f"Question {index} has empty question text")
-        view = item.get("view", "both")
+        view = item.get("view", "both_views")
+        view = VIEW_ALIASES.get(view, view)
         if view not in VIEWS:
             raise ValueError(f"Question {question_id}: view must be one of {', '.join(VIEWS)}")
         at = item.get("at", [0.0, 0.5, 1.0])
@@ -180,7 +186,7 @@ def question_images(video: Path, questions: list[Question], out_dir: Path, insta
     count = get_frame_count(video)
     wanted = {i for q in questions for i in frame_indexes(q, count)}
     frames = read_frames(video, wanted)
-    towel_views = any(q.view.endswith("_towel") for q in questions)
+    towel_views = any(q.view.endswith("_object") for q in questions)
     inst = {}
     if towel_views and instance is not None and instance.is_file():
         inst_count = get_frame_count(instance)
@@ -195,11 +201,11 @@ def question_images(video: Path, questions: list[Question], out_dir: Path, insta
             path = d / f"{i:04d}.jpg"
             if not path.is_file():
                 img = frames[i]
-                if q.view != "both":
+                if q.view != "both_views":
                     half = img.shape[1] // 2
-                    x = 0 if q.view.startswith("room") else half
+                    x = 0 if q.view.startswith("third_person") else half
                     img = img[:, x:x + half]
-                    if q.view.endswith("_towel"):
+                    if q.view.endswith("_object"):
                         box = towel_box(inst[i][:, x:x + half], towel_color) if i in inst else None
                         if box is not None:
                             img = np.asarray(Image.fromarray(img).crop(box).resize((CROP_SIZE, CROP_SIZE),
@@ -280,7 +286,7 @@ class QwenChecker:
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--video", type=Path, required=True)
-    p.add_argument("--instance", type=Path, help="instance video for the *_towel views "
+    p.add_argument("--instance", type=Path, help="instance video for the *_object views "
                    "(default: demo_XXX_instance_all.mp4 or demo_XXX_instance.mp4 next to the video)")
     p.add_argument("--questions", type=Path, default=DEFAULT_QUESTIONS)
     p.add_argument("--model", default=DEFAULT_MODEL)

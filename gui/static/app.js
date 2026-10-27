@@ -1194,7 +1194,7 @@ const BATCH_VLM_FIELDS = [
     help: "Weights in checkpoints/vlm/ (downloaded there on first use). The default questions' thresholds " +
           "were tuned for the 7B model." },
   { key: "towel_color", label: "Towel color (instance video)", type: "text",
-    help: "R,G,B of the towel in the instance video, for the towel close-ups (room_towel / wrist_towel views). " +
+    help: "R,G,B of the object in the instance video, for the object close-ups (third_person_view_object / wrist_view_object views). " +
           "Several colors separated by ; when the towel color differs between videos." },
   { key: "min_free_gb", label: "Min free GPU memory (GB)", type: "number", min: 0,
     help: "Runs on each demo right after its comparison. The model is loaded once, on the tracking GPU " +
