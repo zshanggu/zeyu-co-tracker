@@ -8,8 +8,11 @@ Round 0 runs the starting questions. Every later round:
     2. runs the writer in the run folder (`claude -p`), with only read access to the run folder
        -> round<r>/writer_report.md, round<r>/writer_stream.jsonl, round<r>/files_read.json
     3. takes the questions from the ```json block of the report -> round<r>/questions.json
-    4. runs the batch on the machine of the GUI server (run_batch.py) and scores it (score.py)
-    5. copies score.json, pyes.csv and the frames the checker saw back -> round<r>/
+    4. runs the batch on the machine of the GUI server (run_batch.py) and scores it (score.py); with "calibrate"
+       (the default) score.py sets every threshold from the batch's P(yes) values (see score.py), so the writer
+       does not guess thresholds
+    5. copies score.json, pyes.csv (and score_as_run.json, questions_calibrated.json) and the frames the
+       checker saw back -> round<r>/
 The loop stops after `patience` rounds in a row without more correct videos (a tie is no gain), after
 `max_rounds`, when a file STOP appears in the run folder, or on SIGTERM (after the current step). Anything
 unexpected (writer error, no ```json block, wrong number of questions, a file read outside the run folder,
@@ -31,6 +34,7 @@ Config (JSON):
     set_dir           the set folder there (make_set.py)
     sheets_dir        where make_sheets.py writes the sheets there (default <work_dir>/sheets)
     round0_questions  the starting questions, relative to the repo there (default scripts/vlm_questions.json)
+    calibrate         set the thresholds from each batch's P(yes) values (default true)
     gui, gpus, towel_color, min_free_gb, model     passed to run_batch.py
     wait_minutes, max_wait_hours                   waiting for a free GPU (run_batch.py; default 5 min, 12 h)
     n_questions       questions per round (default 5)
@@ -267,8 +271,11 @@ class Loop:
                stream=True)
         self.check_stop()
         out = f"{rem.repo}/outputs/gui/{name}"
-        rem.py("score.py", out, f"{rem.work}/labels.csv", f"{rem.work}/round{r}")
-        rem.fetch(f"{rem.work}/round{r}", ["score.json", "pyes.csv"], rd)
+        calibrate = cfg.get("calibrate", True)
+        rem.py("score.py", out, f"{rem.work}/labels.csv", f"{rem.work}/round{r}",
+               *(["--calibrate"] if calibrate else []))
+        rem.fetch(f"{rem.work}/round{r}", ["score.json", "pyes.csv"]
+                  + (["score_as_run.json", "questions_calibrated.json"] if calibrate else []), rd)
         rem.fetch(out, [f"{v}/vlm_frames" for v in sorted(self.labels)], rd / "qwen_frames")
         s = json.load(open(rd / "score.json"))
         row = {"round": r, "correct": s["correct"], "videos": s["videos"], "bad_passed": s["bad_passed"],
@@ -350,7 +357,10 @@ class Loop:
         (self.run_dir / "summary.md").write_text("\n".join(lines) + "\n")
         summary = dict(self.status)
         if pick:
-            summary["pick_questions"] = json.load(open(self.run_dir / f"round{pick['round']}" / "questions.json"))
+            pd = self.run_dir / f"round{pick['round']}"
+            qf = pd / "questions_calibrated.json"
+            qf = qf if qf.is_file() else pd / "questions.json"
+            summary["pick_questions"] = json.load(open(qf))
         json.dump(summary, open(self.run_dir / "summary.json", "w"), indent=1)
         self.log(f"finished: {reason}; pick round {pick['round'] if pick else '-'}")
 
