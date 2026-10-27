@@ -15,6 +15,8 @@
  "gpus": [0],
  "towel_color": "167,18,135",
  "min_free_gb": 18,
+ "wait_minutes": 5,
+ "max_wait_hours": 12,
  "model": "Qwen/Qwen2.5-VL-7B-Instruct",
  "n_questions": 5,
  "max_rounds": 8,

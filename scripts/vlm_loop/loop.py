@@ -32,6 +32,7 @@ Config (JSON):
     sheets_dir        where make_sheets.py writes the sheets there (default <work_dir>/sheets)
     round0_questions  the starting questions, relative to the repo there (default scripts/vlm_questions.json)
     gui, gpus, towel_color, min_free_gb, model     passed to run_batch.py
+    wait_minutes, max_wait_hours                   waiting for a free GPU (run_batch.py; default 5 min, 12 h)
     n_questions       questions per round (default 5)
     max_rounds        last round number (default 8)
     patience          rounds without gain before the stop (default 2)
@@ -260,7 +261,10 @@ class Loop:
         rem.py("run_batch.py", "--set_dir", cfg["set_dir"], "--name", name, "--questions", qfile,
                "--gui", cfg.get("gui", "http://localhost:7861"), "--gpus", ",".join(map(str, cfg.get("gpus", [0]))),
                "--towel_color", cfg["towel_color"], "--min_free_gb", str(cfg.get("min_free_gb", 18)),
-               "--model", cfg.get("model", "Qwen/Qwen2.5-VL-7B-Instruct"), stream=True)
+               "--model", cfg.get("model", "Qwen/Qwen2.5-VL-7B-Instruct"),
+               "--wait_minutes", str(cfg.get("wait_minutes", 5)),
+               "--max_wait_hours", str(cfg.get("max_wait_hours", 12)),
+               stream=True)
         self.check_stop()
         out = f"{rem.repo}/outputs/gui/{name}"
         rem.py("score.py", out, f"{rem.work}/labels.csv", f"{rem.work}/round{r}")

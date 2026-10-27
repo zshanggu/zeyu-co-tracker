@@ -7,9 +7,12 @@ Run it on the machine of the GUI server (the server reads the files). It makes o
 with links to the demo folders of SET_DIR, starts the batch like the Start button of the Batch dialog (all
 CoTracker steps off, only "vlm" on), and waits. The results are in outputs/gui/BATCH_NAME and show in the GUI.
 
-The batch is stopped and the script fails when the checker loads on the CPU instead of a GPU (no GPU of --gpus
-has --min_free_gb free), when another batch is running, or when a video fails. A finished batch of the same
-name and the same questions is not run again (the script only prints its folder).
+Waiting for a GPU: the checker needs a GPU of --gpus with --min_free_gb free. While there is none (other jobs
+use the GPUs), or another batch is running in the GUI, the script does not start and checks again every
+--wait_minutes. When the checker still loads on the CPU (the space was taken between the check and the load),
+the batch is cancelled and the script waits again. After --max_wait_hours of waiting it fails. It also fails
+when a video fails. A finished batch of the same name and the same questions is not run again (the script only
+prints its folder).
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -24,6 +28,17 @@ import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+def free_gpu_gb(gpus: list[int]) -> dict[int, float]:
+    """{GPU index: free GB} for the given GPUs (nvidia-smi index order, as the batch pipeline uses)."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=30, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    free = {int(i): int(f) / 1024 for i, f in (line.split(",") for line in out.strip().splitlines())}
+    return {g: free[g] for g in gpus if g in free}
 
 
 def api(gui: str, path: str, body: dict | None = None) -> dict:
@@ -76,6 +91,8 @@ def main():
     p.add_argument("--video_suffix", default="_01")
     p.add_argument("--instance_suffix", default="_instance_all")
     p.add_argument("--poll", type=float, default=10, help="seconds between status checks")
+    p.add_argument("--wait_minutes", type=float, default=5, help="minutes between checks while waiting for a GPU")
+    p.add_argument("--max_wait_hours", type=float, default=12, help="fail after waiting this long for a GPU")
     args = p.parse_args()
 
     sys.path.insert(0, str(REPO / "scripts"))
@@ -91,33 +108,48 @@ def main():
         print(f"already done: {out}")
         return
     link_root(args.set_dir, root)
-    cur = api(args.gui, "/api/batch").get("batch")
-    if cur and cur.get("job_status") == "running":
-        sys.exit(f"another batch is running: {cur.get('out')}")
+    gpus = [int(g) for g in args.gpus.split(",") if g != ""]
     body = {"root": str(root.relative_to(REPO)), "a_suffix": "_source_all", "b_suffix": args.video_suffix,
             "instance_suffix": args.instance_suffix,
             "steps": {"track_a": "off", "track_b": "off", "mask": "off", "compare": "off", "vlm": "run"},
-            "track": {"gpus": [int(g) for g in args.gpus.split(",") if g != ""]},
+            "track": {"gpus": gpus},
             "vlm": {"questions": args.questions, "model": args.model, "towel_color": args.towel_color,
                     "min_free_gb": args.min_free_gb}}
-    job = api(args.gui, "/api/batch/start", body).get("job")
-    print(f"batch {args.name} started (job {job})", flush=True)
-    t0, checked_device = time.time(), False
-    while True:
-        time.sleep(args.poll)
-        cur = api(args.gui, "/api/batch").get("batch") or {}
-        if cur.get("job") != job:
-            sys.exit(f"the GUI now shows another batch ({cur.get('out')}); batch {args.name} lost")
-        tail = cur.get("tail") or ""
-        if not checked_device and "VLM check: loading" in tail:
-            line = next(x for x in tail.splitlines() if "VLM check: loading" in x)
-            print(line, flush=True)
-            if " on CPU" in line:
-                api(args.gui, "/api/batch/cancel", {})
-                sys.exit(f"stopped: the checker would run on the CPU ({line.split(' on ', 1)[1]})")
-            checked_device = True
-        if cur.get("job_status") != "running":
+    deadline = time.time() + args.max_wait_hours * 3600
+    while True:  # wait for a free GPU and a free GUI, start, and start again when the checker lands on the CPU
+        free = free_gpu_gb(gpus)
+        cur = api(args.gui, "/api/batch").get("batch")
+        busy = cur and cur.get("job_status") == "running"
+        if busy or not any(f >= args.min_free_gb for f in free.values()):
+            if time.time() > deadline:
+                sys.exit(f"no GPU of {args.gpus} with {args.min_free_gb:g} GB free (or a free GUI) after "
+                         f"{args.max_wait_hours:g} h of waiting")
+            why = f"another batch is running ({cur.get('out')})" if busy else \
+                ", ".join(f"GPU {g} has {f:.1f} GB free" for g, f in free.items()) or f"GPU {args.gpus} not found"
+            print(f"waiting for a GPU: {why}; need {args.min_free_gb:g} GB; next check in {args.wait_minutes:g} min",
+                  flush=True)
+            time.sleep(args.wait_minutes * 60)
+            continue
+        job = api(args.gui, "/api/batch/start", body).get("job")
+        print(f"batch {args.name} started (job {job})", flush=True)
+        t0, device = time.time(), None
+        while True:
+            time.sleep(args.poll)
+            cur = api(args.gui, "/api/batch").get("batch") or {}
+            if cur.get("job") != job:
+                sys.exit(f"the GUI now shows another batch ({cur.get('out')}); batch {args.name} lost")
+            tail = cur.get("tail") or ""
+            if device is None and "VLM check: loading" in tail:
+                line = next(x for x in tail.splitlines() if "VLM check: loading" in x)
+                print(line, flush=True)
+                device = "cpu" if " on CPU" in line else "gpu"
+                if device == "cpu":
+                    api(args.gui, "/api/batch/cancel", {})
+            if cur.get("job_status") != "running":
+                break
+        if device != "cpu":
             break
+        print("the checker loaded on the CPU: batch cancelled, waiting for a GPU again", flush=True)
     demos = ((cur.get("progress") or {}).get("demos") or {})
     failed = [d for d, st in demos.items() if (st.get("vlm") or {}).get("status") not in ("done", "skipped")]
     if cur.get("job_status") != "done" or failed:

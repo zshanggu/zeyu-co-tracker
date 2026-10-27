@@ -16,7 +16,7 @@ bad video that passes as good.
 |---|---|---|
 | `make_set.py` | set folder: links to the chosen demo folders, and `labels.csv` from a verdict CSV | GUI machine |
 | `make_sheets.py` | frame sheets for the writer: `frames11/` (11 moments, full frame), `crops11/` (object close-ups) | GUI machine |
-| `run_batch.py` | one VLM-only batch through the GUI server (like its Start button); stops when the checker would run on the CPU | GUI machine |
+| `run_batch.py` | one VLM-only batch through the GUI server (like its Start button); waits while no allowed GPU has room, never runs the checker on the CPU | GUI machine |
 | `score.py` | the batch against the labels: `score.json`, `pyes.csv` | GUI machine |
 | `prompt_template.txt` | the prompt of the writer, filled each round | - |
 | `loop.py` | the whole loop; only the Python standard library | machine with the `claude` command |
