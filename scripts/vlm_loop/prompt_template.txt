@@ -19,10 +19,10 @@ Folder: {folder} (use only the files listed here)
 
 Task, in two steps.
 Step 1, check: for the questions of the last round, look at the frames the checker saw for the videos with Yes and say whether the asked problem is really there. Also look at the bad videos that got No for all questions, and say what is wrong in them.
-Step 2: write exactly {n_questions} questions. You can keep, change, drop or add any earlier question and change thresholds. The {n_questions} questions must separate the {n_videos} videos 100%:
+Step 2: write exactly {n_questions} questions. You can keep, change, drop or add any earlier question. The {n_questions} questions must separate the {n_videos} videos 100%:
 - every bad video gets Yes for at least one question;
 - every good video gets No for all {n_questions} questions.
-Check this for every video. A question you keep word for word, with the same view and frames, keeps its P(yes) values: use them to set its threshold. The same question can give P(yes) values about 0.03 apart between runs, so keep that margin from the good videos. For new or changed questions, give your best threshold and say so.
+Check this for every video. A question you keep word for word, with the same view and frames, keeps its P(yes) values. You do not set the thresholds: after the checker runs, the threshold of every question is set from its P(yes) values, halfway between the highest P(yes) of a good video and the next higher P(yes) of a bad video, so no good video gets Yes.
 
 Output:
 1. The check of step 1, short, with video numbers.
@@ -31,7 +31,7 @@ Output:
    "question": the text
    "view": "both_views" (full frame), "third_person_view" (left half), "wrist_view" (right half), "third_person_view_object" or "wrist_view_object" (close-up of the object in that half)
    "at": frame positions, 0 = first, 1 = last
-   "threshold": P(yes) above which the answer counts as Yes
+   "threshold": 0.5 (it is set after the run)
 3. A table: each question, kept word for word / changed / new, and from which earlier question.
 4. For each question: the videos you expect to get Yes.
 5. How many of the {n_videos} you expect right; the bad videos expected to pass as good, and the good videos expected to get a Yes, each with the reason. These lists must be empty; if not, say why.
