@@ -36,7 +36,8 @@ Config (JSON):
     n_questions       questions per round (default 5)
     max_rounds        last round number (default 8)
     patience          rounds without gain before the stop (default 2)
-    writer            {"cli": path of the claude command, "model": optional, "timeout_s": default 3600}
+    writer            {"cli": path of the claude command, "model": optional, "effort": optional (low, medium,
+                      high, xhigh, max), "timeout_s": default 3600}
 """
 
 from __future__ import annotations
@@ -142,7 +143,10 @@ def run_writer(prompt: str, run_dir: Path, wcfg: dict, rd: Path, log) -> tuple[s
            "--output-format", "stream-json", "--verbose"]
     if wcfg.get("model"):
         cmd += ["--model", wcfg["model"]]
-    log(f"writer: claude -p --restricted --tools {WRITER_TOOLS} in {folder}")
+    if wcfg.get("effort"):
+        cmd += ["--effort", wcfg["effort"]]
+    log(f"writer: claude -p --restricted --tools {WRITER_TOOLS} in {folder}"
+        f" (model {wcfg.get('model') or 'default'}, effort {wcfg.get('effort') or 'default'})")
     try:
         r = subprocess.run(cmd, input=prompt.encode(), capture_output=True, cwd=folder,
                            timeout=wcfg.get("timeout_s", 3600))
