@@ -282,7 +282,7 @@ class QwenChecker:
         answers = {}
         for q in questions:
             p = self.p_yes(images[q.id], q.text)
-            answers[q.id] = {"p_yes": round(p, 4), "threshold": q.threshold, "answer": "Y" if p > q.threshold else "N"}
+            answers[q.id] = {"p_yes": p, "threshold": q.threshold, "answer": "Y" if p > q.threshold else "N"}
         return answers
 
 

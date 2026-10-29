@@ -50,7 +50,7 @@ def calibrate(questions: list[dict], pyes: dict, labels: dict) -> list[dict]:
         good_max = max(pyes[v][q["id"]] for v in labels if labels[v] == "good")
         above = [pyes[v][q["id"]] for v in labels if labels[v] == "bad" and pyes[v][q["id"]] > good_max]
         upper = min(above) if above else 1.0
-        out.append(dict(q, threshold=round((good_max + upper) / 2, 6)))
+        out.append(dict(q, threshold=(good_max + upper) / 2))
     return out
 
 
