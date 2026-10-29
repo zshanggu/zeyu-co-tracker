@@ -1,5 +1,5 @@
 """VLM quality check of one video: yes/no questions about its frames, asked one at a time to a local
-Qwen2.5-VL model.
+Qwen2.5-VL or Qwen3-VL model.
 
 Each question gets its own images (see "Questions") and is scored by the model's probability of
 answering "Yes" (P(yes), 0..1) instead of a generated Y/N: asked for a plain Y/N the model says N to
@@ -231,18 +231,19 @@ def anomaly_score(answers: dict[str, dict]) -> float:
 
 
 class QwenChecker:
-    """Qwen2.5-VL on one device ("cpu", "cuda:N"), loaded once and reused for every video."""
+    """Qwen2.5-VL or Qwen3-VL (a hub name or a local folder) on one device ("cpu", "cuda:N"), loaded once and
+    reused for every video."""
 
     def __init__(self, model_name: str = DEFAULT_MODEL, device: str = "cpu", model_cache: Path = MODEL_CACHE):
         import torch
-        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+        from transformers import AutoModelForImageTextToText, AutoProcessor
 
         self.torch, self.device = torch, device
         model_cache.mkdir(parents=True, exist_ok=True)
 
         def load(local_only):
             processor = AutoProcessor.from_pretrained(model_name, cache_dir=model_cache, local_files_only=local_only)
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model = AutoModelForImageTextToText.from_pretrained(
                 model_name, torch_dtype="auto", attn_implementation="sdpa", cache_dir=model_cache,
                 local_files_only=local_only)
             return processor, model
@@ -265,7 +266,9 @@ class QwenChecker:
         content.append({"type": "text", "text": f"{question} Answer Yes or No."})
         messages = [{"role": "user", "content": content}]
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(messages)
+        # the images are resized in steps of the model's patch size (14 for Qwen2.5-VL, 16 for Qwen3-VL)
+        image_inputs, video_inputs = process_vision_info(
+            messages, image_patch_size=self.processor.image_processor.patch_size)
         inputs = self.processor(text=[text], images=image_inputs, videos=video_inputs,
                                 return_tensors="pt").to(self.device)
         with self.torch.inference_mode():
