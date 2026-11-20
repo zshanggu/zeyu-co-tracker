@@ -1417,6 +1417,33 @@ function renderBatch(cur) {
   }).join("");
   table.innerHTML = head + rows;
   table.dataset.progress = JSON.stringify(p.demos);
+  // Export filter: one option per VLM question of this batch, keeping the current choice.
+  const qSel = $("#export-question");
+  const ids = questions.map((q) => q.id);
+  if (ids.length && ids.join() !== [...qSel.options].map((o) => o.value).join()) {
+    const keep = qSel.value;
+    qSel.innerHTML = ids.map((id) => `<option value="${esc(id)}">${esc(id)}</option>`).join("");
+    qSel.value = ids.includes(keep) ? keep : ids.includes("room_smear") ? "room_smear" : ids[0];
+  }
+}
+
+async function exportDemos() {
+  const msg = $("#export-msg");
+  msg.textContent = "Exporting…";
+  try {
+    const r = await postJSON("/api/batch/export", {
+      stat: $("#export-stat").value, top_pct: Number($("#export-pct").value),
+      question: $("#export-question").value, max_p_yes: Number($("#export-max").value),
+    });
+    const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    const parts = [`${r.selected.length} demos → <a href="${esc(r.url)}" download>${esc(r.path)}</a>`,
+      `(best ${r.top} of ${r.ranked} ranked; ${r.flagged.length} dropped by the VLM filter` +
+      (r.no_answer.length ? `, ${r.no_answer.length} without a VLM answer` : "") + ")"];
+    if (r.batch_running || r.ranked < r.total) parts.push(`— only ${r.ranked} of ${r.total} demos compared so far`);
+    msg.innerHTML = parts.join(" ");
+  } catch (err) {
+    msg.textContent = err.message;
+  }
 }
 
 // Put a finished demo into a grid row: A and B tracking results, and the comparison.
@@ -1435,6 +1462,7 @@ async function loadDemo(row, steps) {
 $("#btn-batch").onclick = () => openBatch().catch((e) => toast(e.message));
 $("#batch-scan").onclick = () => scanBatch();
 $("#batch-start").onclick = () => startBatch();
+$("#export-btn").onclick = () => exportDemos();
 $("#batch-cancel").onclick = async () => {
   try { await postJSON("/api/batch/cancel", {}); refreshBatch(); } catch (err) { toast(err.message); }
 };

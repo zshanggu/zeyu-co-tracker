@@ -6,7 +6,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     TORCH_HOME=/workspace/.torch_cache
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Plain-HTTP apt downloads from archive.ubuntu.com hang on this network; HTTPS works.
+RUN sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g; s|http://security.ubuntu.com|https://security.ubuntu.com|g' /etc/apt/sources.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg libgl1 libglib2.0-0 git wget \
     && rm -rf /var/lib/apt/lists/*
 

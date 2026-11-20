@@ -114,6 +114,21 @@
           </label>
         </div>
         <div class="batch-table-wrap"><table id="batch-table"></table></div>
+        <div class="batch-export">
+          <span>Export demos in the best
+            <input id="export-pct" type="number" min="1" max="100" step="1" value="80">% by
+            <select id="export-stat">
+              <option value="overall_mean">overall mean</option>
+              <option value="overall_median">overall median</option>
+              <option value="auc_mean">AUC mean</option>
+              <option value="auc_median">AUC median</option>
+            </select>
+            with VLM <select id="export-question"><option value="room_smear">room_smear</option></select>
+            P(yes) &lt; <input id="export-max" type="number" min="0" max="1" step="0.05" value="0.5">
+          </span>
+          <button type="button" id="export-btn">Export .txt</button>
+          <span id="export-msg" class="hint"></span>
+        </div>
         <pre id="batch-log"></pre>
       </div>
       <div class="dlg-row">

@@ -196,12 +196,17 @@ def browse(dir: str = "", kind: str = "video"):
     for e in sorted(d.iterdir(), key=lambda e: e.name.lower()):
         if e.name.startswith("."):
             continue
-        if e.is_dir():
-            dirs.append(rel(e))
-            if (e / "tracks.npy").is_file():
-                results.append(rel(e))
-        elif e.suffix.lower() in exts:
-            files.append(rel(e))
+        try:  # one unreadable entry (e.g. a root-owned ~/docker) must not break the whole listing
+            if e.is_dir():
+                if not os.access(e, os.R_OK | os.X_OK):
+                    continue
+                dirs.append(rel(e))
+                if (e / "tracks.npy").is_file():
+                    results.append(rel(e))
+            elif e.suffix.lower() in exts:
+                files.append(rel(e))
+        except OSError:
+            continue
     at_root = d in ROOTS
     parent = "" if at_root else (rel(d.parent) if d.parent != REPO else ".")
     return {"dir": rel(d) if d != REPO else ".", "parent": parent, "dirs": dirs, "files": files,
@@ -613,6 +618,47 @@ def current_batch():
 @app.get("/api/batch")
 def batch_get():
     return {"batch": current_batch()}
+
+
+class BatchExportReq(BaseModel):
+    stat: str = "overall_mean"  # comparison statistic to rank by, low to high (low = most similar)
+    top_pct: float = 80  # keep the best top_pct % of the ranked demos ...
+    question: str = "room_smear"  # ... whose VLM P(yes) for this question ...
+    max_p_yes: float = 0.5  # ... is below this
+
+
+@app.post("/api/batch/export")
+def batch_export(r: BatchExportReq):
+    """Write <batch out>/demos_<stat>_top<pct>_<question>_lt<max>.txt: the demos in the best top_pct % by
+    `stat` (ranked low to high, like the batch table) whose VLM P(yes) for `question` is below max_p_yes.
+    One demo name per line, best rank first. Demos without that VLM answer are left out."""
+    stats = ("overall_mean", "overall_median", "auc_mean", "auc_median")
+    if r.stat not in stats:
+        raise HTTPException(400, f"stat must be one of {', '.join(stats)}")
+    if not 0 < r.top_pct <= 100:
+        raise HTTPException(400, "top % must be in (0, 100]")
+    if not 0 <= r.max_p_yes <= 1:
+        raise HTTPException(400, "P(yes) limit must be in [0, 1]")
+    cur = current_batch()
+    demos = ((cur or {}).get("progress") or {}).get("demos")
+    if not demos:
+        raise HTTPException(404, "no batch results")
+    # Same order as the batch table: by the statistic, ties in folder order.
+    ranked = sorted((st["compare"][r.stat], name) for name, st in demos.items()
+                    if (st.get("compare") or {}).get(r.stat) is not None)
+    if not ranked:
+        raise HTTPException(400, f"no finished comparisons with {r.stat}")
+    top = [name for _, name in ranked[: int(len(ranked) * r.top_pct / 100 + 1e-9)]]
+    selected, flagged, no_answer = [], [], []
+    for name in top:
+        a = (((demos[name].get("vlm") or {}).get("answers")) or {}).get(r.question) or {}
+        p = a.get("p_yes")
+        (no_answer if p is None else selected if p < r.max_p_yes else flagged).append(name)
+    path = REPO / cur["out"] / f"demos_{r.stat}_top{r.top_pct:g}_{r.question}_lt{r.max_p_yes:g}.txt"
+    path.write_text("".join(f"{n}\n" for n in selected))
+    return {"path": rel(path), "url": f"/media?path={rel(path)}&v={int(path.stat().st_mtime)}",
+            "selected": selected, "ranked": len(ranked), "total": len(demos), "top": len(top),
+            "flagged": flagged, "no_answer": no_answer, "batch_running": cur["job_status"] == "running"}
 
 
 @app.post("/api/batch/start")

@@ -185,7 +185,10 @@ def question_images(video: Path, questions: list[Question], out_dir: Path, insta
         inst = {i: inst[min(i, inst_count - 1)] for i in wanted}
     images: dict[str, list[Path]] = {}
     for q in questions:
-        d = out_dir / video.stem / q.view
+        # Images are cached by path, so the towel crops' folder names the towel color: a run with a
+        # different towel_color must not reuse another color's crops.
+        view_dir = q.view + ("_" + "-".join(str(int(c)) for c in towel_color) if q.view.endswith("_towel") else "")
+        d = out_dir / video.stem / view_dir
         d.mkdir(parents=True, exist_ok=True)
         paths = []
         for i in frame_indexes(q, count):
