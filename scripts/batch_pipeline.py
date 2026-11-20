@@ -21,7 +21,8 @@ See DEFAULTS below for the keys.
 
 The VLM check (scripts/vlm_check.py) runs on video B: each question of "vlm.questions" (default
 scripts/vlm_questions.json) is asked on its own, with its own frames and view (a towel close-up uses the
-instance video and "vlm.towel_color"), to a local Qwen2.5-VL model (weights in checkpoints/vlm/). A
+instance video and "vlm.towel_color": one or more colors, "R,G,B; R,G,B", a pixel close to any of them is
+towel), to a local Qwen2.5-VL model (weights in checkpoints/vlm/). A
 question is flagged when the model's P(yes) is above its threshold, and every flag adds 1/M to the
 anomaly score (0 = no issue found, 1 = all issues found).
 It runs on each demo right after its comparison. The model is loaded once, at the first video that
@@ -317,7 +318,7 @@ class VlmCheck:
 
         v = self.v
         try:
-            towel = parse_colors(v.get("towel_color") or "167,18,135")[0]
+            towel = parse_colors(v.get("towel_color") or "167,18,135")
             images = vlm_check.question_images(video, self.questions, out_dir / "vlm_frames",
                                                instance if instance.is_file() else None, towel)
             answers = self.model.ask(images, self.questions)
