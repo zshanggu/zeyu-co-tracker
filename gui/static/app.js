@@ -1418,14 +1418,23 @@ function renderBatch(cur) {
   }).join("");
   table.innerHTML = head + rows;
   table.dataset.progress = JSON.stringify(p.demos);
-  // Export filter: one option per VLM question of this batch, keeping the current choice.
+  // Export filter: the VLM anomaly score, then one option per VLM question of this batch, keeping the
+  // current choice.
   const qSel = $("#export-question");
-  const ids = questions.map((q) => q.id);
-  if (ids.length && ids.join() !== [...qSel.options].map((o) => o.value).join()) {
+  const ids = [EXPORT_SCORE, ...questions.map((q) => q.id)];
+  if (questions.length && ids.join() !== [...qSel.options].map((o) => o.value).join()) {
     const keep = qSel.value;
-    qSel.innerHTML = ids.map((id) => `<option value="${esc(id)}">${esc(id)}</option>`).join("");
-    qSel.value = ids.includes(keep) ? keep : ids.includes("room_smear") ? "room_smear" : ids[0];
+    qSel.innerHTML = ids.map((id) => `<option value="${esc(id)}">${
+      id === EXPORT_SCORE ? "anomaly score (final)" : esc(id)}</option>`).join("");
+    qSel.value = ids.includes(keep) ? keep : ids.includes("room_smear") ? "room_smear" : EXPORT_SCORE;
+    exportLabel();
   }
+}
+
+// Export filter value for the VLM anomaly score (fraction of flagged questions) instead of one question.
+const EXPORT_SCORE = "*score*";
+function exportLabel() {
+  $("#export-max-label").textContent = $("#export-question").value === EXPORT_SCORE ? "score" : "P(yes)";
 }
 
 async function exportDemos() {
@@ -1464,6 +1473,7 @@ $("#btn-batch").onclick = () => openBatch().catch((e) => toast(e.message));
 $("#batch-scan").onclick = () => scanBatch();
 $("#batch-start").onclick = () => startBatch();
 $("#export-btn").onclick = () => exportDemos();
+$("#export-question").addEventListener("change", exportLabel);
 $("#batch-cancel").onclick = async () => {
   try { await postJSON("/api/batch/cancel", {}); refreshBatch(); } catch (err) { toast(err.message); }
 };

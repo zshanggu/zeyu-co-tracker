@@ -194,9 +194,12 @@ def question_images(video: Path, questions: list[Question], out_dir: Path, insta
         inst = {i: inst[min(i, inst_count - 1)] for i in wanted}
     images: dict[str, list[Path]] = {}
     for q in questions:
-        # Images are cached by path, so the towel crops' folder names the towel color: a run with a
+        # Images are cached by path, so the object crops' folder names the towel color(s): a run with a
         # different towel_color must not reuse another color's crops.
-        view_dir = q.view + ("_" + "-".join(str(int(c)) for c in towel_color) if q.view.endswith("_towel") else "")
+        view_dir = q.view
+        if q.view.endswith("_object"):
+            colors = np.asarray(towel_color).reshape(-1, 3)
+            view_dir += "_" + "_".join("-".join(str(int(v)) for v in c) for c in colors)
         d = out_dir / video.stem / view_dir
         d.mkdir(parents=True, exist_ok=True)
         paths = []
