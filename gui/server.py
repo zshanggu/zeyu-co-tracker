@@ -621,6 +621,7 @@ def batch_get():
 
 
 EXPORT_VLM_SCORE = "*score*"  # `question` value for the VLM anomaly score (not a valid question id)
+EXPORT_NO_VLM = "*none*"  # `question` value for no VLM filter: rank by `stat` only
 
 
 class BatchExportReq(BaseModel):
@@ -633,7 +634,7 @@ class BatchExportReq(BaseModel):
 @app.post("/api/batch/export")
 def batch_export(r: BatchExportReq):
     """Write <batch out>/demos_<stat>_top<pct>_<question>_lt<max>.txt: the demos in the best top_pct % by
-    `stat` (ranked low to high, like the batch table) whose VLM P(yes) for `question` (or, with
+    `stat` (ranked low to high, like the batch table) whose VLM P(yes) for `question` (no VLM filter with question = EXPORT_NO_VLM; or, with
     question = EXPORT_VLM_SCORE, the VLM anomaly score: fraction of flagged questions) is below max_p_yes.
     One demo name per line, best rank first. Demos without that VLM value are left out."""
     stats = ("overall_mean", "overall_median", "auc_mean", "auc_median")
@@ -656,11 +657,18 @@ def batch_export(r: BatchExportReq):
     selected, flagged, no_answer = [], [], []
     by_score = r.question == EXPORT_VLM_SCORE
     for name in top:
+        if r.question == EXPORT_NO_VLM:
+            selected.append(name)
+            continue
         vlm = demos[name].get("vlm") or {}
         p = vlm.get("vlm_score") if by_score else ((vlm.get("answers") or {}).get(r.question) or {}).get("p_yes")
         (no_answer if p is None else selected if p < r.max_p_yes else flagged).append(name)
-    tag = "vlmscore" if by_score else r.question
-    path = REPO / cur["out"] / f"demos_{r.stat}_top{r.top_pct:g}_{tag}_lt{r.max_p_yes:g}.txt"
+    if r.question == EXPORT_NO_VLM:
+        name = f"demos_{r.stat}_top{r.top_pct:g}.txt"
+    else:
+        tag = "vlmscore" if by_score else r.question
+        name = f"demos_{r.stat}_top{r.top_pct:g}_{tag}_lt{r.max_p_yes:g}.txt"
+    path = REPO / cur["out"] / name
     path.write_text("".join(f"{n}\n" for n in selected))
     return {"path": rel(path), "url": f"/media?path={rel(path)}&v={int(path.stat().st_mtime)}",
             "selected": selected, "ranked": len(ranked), "total": len(demos), "top": len(top),

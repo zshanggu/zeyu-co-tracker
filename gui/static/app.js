@@ -1421,11 +1421,11 @@ function renderBatch(cur) {
   // Export filter: the VLM anomaly score, then one option per VLM question of this batch, keeping the
   // current choice.
   const qSel = $("#export-question");
-  const ids = [EXPORT_SCORE, ...questions.map((q) => q.id)];
+  const ids = [EXPORT_NONE, EXPORT_SCORE, ...questions.map((q) => q.id)];
   if (questions.length && ids.join() !== [...qSel.options].map((o) => o.value).join()) {
     const keep = qSel.value;
     qSel.innerHTML = ids.map((id) => `<option value="${esc(id)}">${
-      id === EXPORT_SCORE ? "anomaly score (final)" : esc(id)}</option>`).join("");
+      id === EXPORT_NONE ? "none (no VLM filter)" : id === EXPORT_SCORE ? "anomaly score (final)" : esc(id)}</option>`).join("");
     qSel.value = ids.includes(keep) ? keep : ids.includes("room_smear") ? "room_smear" : EXPORT_SCORE;
     exportLabel();
   }
@@ -1433,8 +1433,11 @@ function renderBatch(cur) {
 
 // Export filter value for the VLM anomaly score (fraction of flagged questions) instead of one question.
 const EXPORT_SCORE = "*score*";
+const EXPORT_NONE = "*none*";  // no VLM filter: rank by the comparison statistic only
 function exportLabel() {
-  $("#export-max-label").textContent = $("#export-question").value === EXPORT_SCORE ? "score" : "P(yes)";
+  const q = $("#export-question").value;
+  $("#export-max-label").textContent = q === EXPORT_SCORE ? "score" : "P(yes)";
+  $("#export-max-wrap").hidden = q === EXPORT_NONE;
 }
 
 async function exportDemos() {
@@ -1449,6 +1452,7 @@ async function exportDemos() {
     const parts = [`${r.selected.length} demos → <a href="${esc(r.url)}" download>${esc(r.path)}</a>`,
       `(best ${r.top} of ${r.ranked} ranked; ${r.flagged.length} dropped by the VLM filter` +
       (r.no_answer.length ? `, ${r.no_answer.length} without a VLM answer` : "") + ")"];
+    if ($("#export-question").value === EXPORT_NONE) parts[1] = `(best ${r.top} of ${r.ranked} ranked, no VLM filter)`;
     if (r.batch_running || r.ranked < r.total) parts.push(`— only ${r.ranked} of ${r.total} demos compared so far`);
     msg.innerHTML = parts.join(" ");
   } catch (err) {

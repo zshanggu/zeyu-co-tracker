@@ -124,11 +124,12 @@
               <option value="auc_median">AUC median</option>
             </select>
             with VLM <select id="export-question">
+              <option value="*none*">none (no VLM filter)</option>
               <option value="*score*">anomaly score (final)</option>
               <option value="room_smear">room_smear</option>
             </select>
-            <span id="export-max-label">P(yes)</span> &lt;
-            <input id="export-max" type="number" min="0" max="1" step="0.05" value="0.5">
+            <span id="export-max-wrap"><span id="export-max-label">P(yes)</span> &lt;
+            <input id="export-max" type="number" min="0" max="1" step="0.05" value="0.5"></span>
           </span>
           <button type="button" id="export-btn">Export .txt</button>
           <span id="export-msg" class="hint"></span>
