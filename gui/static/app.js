@@ -1172,7 +1172,17 @@ async function syncState() {
 // video, then a masked compare (scripts/batch_pipeline.py). One batch runs at a time on the
 // server; any page can watch it and load a finished demo into a row of the grid.
 
-const BATCH_TRACK_FIELDS = TRACK_FIELDS.filter((f) => !["grid_query_frame", "mask"].includes(f.key));
+const BATCH_TRACK_FIELDS = [
+  ...TRACK_FIELDS.filter((f) => !["grid_query_frame", "mask"].includes(f.key)),
+  { key: "workers_per_gpu", label: "Parallel demos per GPU", type: "select",
+    options: [["auto", "auto (from free GPU memory)"], ["1", "1"], ["2", "2"], ["3", "3"], ["4", "4"],
+              ["0", "0 (one demo at a time)"]],
+    help: "Several demos run at once, each tracked on one GPU while the others track or run mask / compare / " +
+          "VLM, so every GPU stays busy; tracks are the same as one at a time. auto: as many per GPU as its " +
+          "free memory allows when the batch starts (~7 GB per job for 611 frames of 1024×512, 2 GB kept " +
+          "free, plus room for the VLM model when that step is on; at most 4). 0 = one demo at a time, its " +
+          "points split over all the selected GPUs." },
+];
 const BATCH_MASK_FIELDS = [
   { key: "colors", label: "Color(s) R,G,B", type: "text",
     help: 'Selected color block in the instance video; several separated by ";".' },
@@ -1202,7 +1212,8 @@ const BATCH_VLM_FIELDS = [
           "has this much free, or no GPU is selected (7B needs ~17 GB, 3B ~8 GB)." },
 ];
 const BATCH_DEFAULTS = () => ({
-  track: Object.fromEntries(BATCH_TRACK_FIELDS.map((f) => [f.key, structuredClone(TRACK_DEFAULTS[f.key])])),
+  track: { ...Object.fromEntries(BATCH_TRACK_FIELDS.map((f) => [f.key, structuredClone(TRACK_DEFAULTS[f.key])])),
+           workers_per_gpu: "auto" },
   mask: { colors: "167,18,135", tolerance: 30, cleanup: true, close: 5, open: 3 },
   compare: { ...Object.fromEntries(BATCH_COMPARE_FIELDS.map((f) => [f.key, COMPARE_DEFAULTS[f.key]])),
              direction: "B vs A" },
@@ -1244,6 +1255,7 @@ async function openBatch() {
   const cfg = BATCH_DEFAULTS();
   if (cur && cur.config) {  // prefill with the last batch's settings
     for (const k of ["track", "mask", "compare", "vlm"]) Object.assign(cfg[k], cur.config[k] || {});
+    cfg.track.workers_per_gpu = String(cfg.track.workers_per_gpu ?? "auto");  // the dropdown values are strings
     if (!("towel_color" in (cur.config.vlm || {}))) {
       // A batch from before the P(yes) questions: its 3B model / memory settings are not restored.
       Object.assign(cfg.vlm, { model: BATCH_DEFAULTS().vlm.model, min_free_gb: BATCH_DEFAULTS().vlm.min_free_gb });
@@ -1359,7 +1371,8 @@ function renderBatch(cur) {
     running: p && p.current ? `running — ${p.current}` : "running…", done: "finished",
     cancelled: "cancelled", failed: "stopped with an error", lost: "interrupted (server restarted)",
   }[cur.job_status] || cur.job_status;
-  $("#batch-state").textContent = `· ${cur.root} → ${cur.out} · ${stateText}`;
+  $("#batch-state").textContent = `· ${cur.root} → ${cur.out} · ${stateText}` +
+    (p && p.workers_plan ? ` · ${p.workers > 1 ? `${p.workers} parallel workers: ` : ""}${p.workers_plan}` : "");
   $("#batch-log").textContent = cur.tail || "";
   const table = $("#batch-table");
   if (!p) { table.innerHTML = "<tr><td>Starting…</td></tr>"; return; }

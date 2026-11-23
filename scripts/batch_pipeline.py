@@ -28,7 +28,21 @@ anomaly score (0 = no issue found, 1 = all issues found).
 It runs on each demo right after its comparison. The model is loaded once, at the first video that
 needs it, and stays loaded for the rest of the batch, on the tracking GPU ("track.gpus") with the most
 free memory if at least "vlm.min_free_gb" are free there, and on the CPU otherwise (or when no GPU is
-selected).
+selected). One VLM call runs at a time, shared by all workers.
+
+Parallel demos ("track.workers_per_gpu", default "auto"): several demos are processed at once, each by a
+worker with its own GPU slot, so one demo's tracking runs on a single GPU while other demos track on the
+other GPUs (or the same one) and run their mask / compare / VLM steps on the CPU. This keeps every GPU busy
+instead of tracking one video at a time on all of them. With "track.chunk_size" 0 the points are still split
+into len(track.gpus) chunks, exactly as a single job on all the GPUs would, so the tracks are the same.
+  "auto"  workers per GPU from its free memory when the batch starts: (free - reserve) / job size, at most
+          AUTO_MAX_PER_GPU. The job size is estimated from the first video (frames x H x W x 3 float32 on
+          the GPU, plus JOB_OVERHEAD_GB for the model and activations; 7.1 GB measured for 611 frames of
+          1024x512). The reserve is SAFETY_GB on every GPU, plus "vlm.min_free_gb" on the GPU with the most
+          free memory when the VLM step is on (the model is loaded there). A GPU without room gets no
+          worker; when no GPU has room, one worker runs on the GPU with the most free memory.
+  N       N workers on every selected GPU.
+  0       the old behaviour: one demo at a time, its points split over all the selected GPUs.
 
 Each step (track_a, track_b, mask, compare, vlm) has a mode, config key "steps":
     run      always run it (redo an existing output)
@@ -42,9 +56,12 @@ videos that have no result yet, and {"track_a": "missing", "track_b": "missing",
 import argparse
 import copy
 import json
+import queue
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -62,7 +79,7 @@ DEFAULTS = {
     "steps": {"track_a": "run", "track_b": "run", "mask": "run", "compare": "run", "vlm": "run"},
     "track": {"mode": "offline", "grid_size": "200x100", "gpus": [0], "chunk_size": 0,
               "segment_len": 10, "radius": 2, "frame_stride": 1, "max_frames": 0,
-              "backward_tracking": False},
+              "backward_tracking": False, "workers_per_gpu": "auto"},
     "mask": {"colors": "167,18,135", "tolerance": 30, "cleanup": True, "open": 3, "close": 5},
     "compare": {"direction": "B vs A", "view": "pairs", "metric": "position", "time": "truncate",
                 "radius": 2, "vmax": None, "mask_step": 5, "mask_rule": "both"},
@@ -70,6 +87,9 @@ DEFAULTS = {
             "towel_color": "167,18,135"},
 }
 STEPS = ("track_a", "track_b", "mask", "compare", "vlm")
+AUTO_MAX_PER_GPU = 4  # "auto" never puts more tracking jobs than this on one GPU (more stop helping)
+JOB_OVERHEAD_GB = 4.0  # GPU memory of a tracking job besides the video (model, CUDA context, activations)
+SAFETY_GB = 2.0  # left free on every GPU by "auto" (other users' jobs grow and shrink)
 MODES = ("run", "missing", "off")
 
 
@@ -106,23 +126,37 @@ def rel(p):
 
 
 class Status:
-    """batch_status.json: {started, finished, current, demos: {name: {step: {...}}}}."""
+    """batch_status.json: {started, finished, current, workers, demos: {name: {step: {...}}}}.
+    Thread-safe: the parallel workers all update it. "current" lists the steps running right now."""
 
-    def __init__(self, path, demos):
+    def __init__(self, path, demos, workers=1):
         self.path = path
-        self.data = {"started": time.time(), "finished": None, "current": None,
+        self.lock = threading.RLock()
+        self.running = {}  # demo -> step (with GPU) running now
+        self.data = {"started": time.time(), "finished": None, "current": None, "workers": workers,
                      "demos": {d: {s: {"status": "pending"} for s in STEPS} for d in demos}}
         self.save()
 
-    def set(self, demo, step, status, **extra):
-        self.data["demos"][demo][step] = {"status": status, **extra}
-        self.data["current"] = f"{demo}: {step}" if status == "running" else self.data["current"]
-        self.save()
+    def set(self, demo, step, status, gpu=None, **extra):
+        with self.lock:
+            self.data["demos"][demo][step] = {"status": status, **extra, **({"gpu": gpu} if gpu is not None else {})}
+            if status == "running":
+                self.running[demo] = f"{demo}: {step}" + (f" (GPU {gpu})" if gpu is not None else "")
+            elif self.running.get(demo, "").startswith(f"{demo}: {step}"):
+                self.running.pop(demo)
+            self.data["current"] = ", ".join(self.running[d] for d in sorted(self.running)) or None
+            self.save()
+
+    def note(self, text):
+        with self.lock:
+            self.data["current"] = text
+            self.save()
 
     def save(self):
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, indent=1))
-        tmp.replace(self.path)
+        with self.lock:
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.data, indent=1))
+            tmp.replace(self.path)
 
 
 def run(cmd, log_path):
@@ -135,19 +169,36 @@ def run(cmd, log_path):
     return rc, "\n".join(tail)
 
 
-def track_cmd(video, save_dir, t):
+def grid_points(spec):
+    """Number of grid points of a --grid_size spec: "N" -> N*N, "COLSxROWS" -> COLS*ROWS (as track_video.py)."""
+    s = str(spec).lower().replace(" ", "")
+    if "x" in s:
+        cols, rows = s.split("x")
+        return int(cols) * int(rows)
+    return int(s) ** 2
+
+
+def track_cmd(video, save_dir, t, gpu=None):
+    """track_video.py command; `gpu` pins the job to that one GPU (parallel workers). With chunk_size 0 the
+    points are then split in len(gpus) chunks anyway, as one job on all the GPUs would, so tracks match."""
+    chunk = int(t["chunk_size"] or 0)
+    if gpu is not None and not chunk and len(t.get("gpus") or []) > 1:
+        chunk = -(-grid_points(t["grid_size"]) // len(t["gpus"]))
     cmd = [sys.executable, "scripts/track_video.py", "--video", rel(video), "--save_dir", rel(save_dir),
            "--mode", t["mode"], "--grid_size", str(t["grid_size"]), "--radius", str(t["radius"]),
-           "--chunk_size", str(t["chunk_size"]), "--segment_len", str(t["segment_len"]),
+           "--chunk_size", str(chunk), "--segment_len", str(t["segment_len"]),
            "--frame_stride", str(t["frame_stride"]), "--max_frames", str(t["max_frames"])]
-    if t.get("gpus"):
+    if gpu is not None:
+        cmd += ["--gpus", str(gpu)]
+    elif t.get("gpus"):
         cmd += ["--gpus", ",".join(str(g) for g in t["gpus"])]
     if t.get("backward_tracking"):
         cmd.append("--backward_tracking")
     return cmd
 
 
-def process(demo_dir, out_dir, cfg, status):
+def process(demo_dir, out_dir, cfg, status, gpu=None):
+    """Track A and B (on `gpu` only when given, else on all of track.gpus), mask, compare for one demo."""
     name = demo_dir.name
     out_dir.mkdir(parents=True, exist_ok=True)
     va = demo_dir / f"{name}{cfg['a_suffix']}.mp4"
@@ -171,11 +222,11 @@ def process(demo_dir, out_dir, cfg, status):
         if mode[step] == "missing" and (save / "tracks.npy").is_file():
             status.set(name, step, "skipped", dir=rel(save), note="already done")
             continue
-        status.set(name, step, "running")
+        status.set(name, step, "running", gpu=gpu)
         t0 = time.time()
-        rc, tail = run(track_cmd(video, save, cfg["track"]), out_dir / f"{step}.log")
+        rc, tail = run(track_cmd(video, save, cfg["track"], gpu), out_dir / f"{step}.log")
         ok = rc == 0 and (save / "tracks.npy").is_file()
-        status.set(name, step, "done" if ok else "failed", dir=rel(save),
+        status.set(name, step, "done" if ok else "failed", dir=rel(save), gpu=gpu,
                    seconds=round(time.time() - t0, 1), **({} if ok else {"error": tail}))
 
     mask_path = out_dir / f"{vi.stem}_mask.npy"
@@ -250,6 +301,60 @@ def free_gpu_memory():
         return {}
 
 
+def job_gb(video, t):
+    """Estimated GPU memory (GB) of one tracking job on `video`: the frames as float32 on the GPU plus
+    JOB_OVERHEAD_GB."""
+    import cv2
+
+    cap = cv2.VideoCapture(str(video))
+    n, w, h = (int(cap.get(k)) for k in (cv2.CAP_PROP_FRAME_COUNT, cv2.CAP_PROP_FRAME_WIDTH,
+                                         cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    n = -(-n // max(int(t.get("frame_stride") or 1), 1))
+    if int(t.get("max_frames") or 0):
+        n = min(n, int(t["max_frames"]))
+    return n * w * h * 3 * 4 / 2**30 + JOB_OVERHEAD_GB
+
+
+def worker_slots(cfg, demos):
+    """GPU slots, one per worker (a GPU listed k times runs k demos at once), and a line describing them.
+    [] = one demo at a time on all the GPUs."""
+    t = cfg["track"]
+    gpus = list(t.get("gpus") or [])
+    setting = str(t.get("workers_per_gpu", "auto")).strip().lower()
+    if not gpus:
+        return [], "one demo at a time on the CPU (no GPU selected)"
+    if setting != "auto":
+        n = int(float(setting or 0))
+        if n <= 0:
+            return [], f"one demo at a time, points split over GPUs {gpus}"
+        return [g for _ in range(n) for g in gpus], f"{n} per GPU on {gpus}"
+    free = {g: f / 1024 for g, f in free_gpu_memory().items() if g in gpus}  # GB
+    if not free:
+        return [], f"one demo at a time (could not read free memory of GPUs {gpus})"
+    videos = [d / f"{d.name}{cfg[k]}.mp4" for d in demos for k in ("a_suffix", "b_suffix")]
+    video = next((v for v in videos if v.is_file()), None)
+    if video is None or step_modes(cfg)["track_a"] == step_modes(cfg)["track_b"] == "off":
+        per = {g: 1 for g in free}  # no tracking: the workers only overlap mask / compare / VLM
+        job = 0.0
+    else:
+        job = job_gb(video, t)
+        reserve = {g: SAFETY_GB for g in free}
+        if step_modes(cfg)["vlm"] != "off":
+            reserve[max(free, key=free.get)] += float(cfg["vlm"].get("min_free_gb", 10))
+        per = {g: max(0, min(AUTO_MAX_PER_GPU, int((free[g] - reserve[g]) // job))) for g in free}
+    if not any(per.values()):
+        best = max(free, key=free.get)
+        per = {best: 1}
+        note = (f" (no GPU has room for a {job:.1f} GB job next to the {SAFETY_GB:g} GB safety margin"
+                + (" and the VLM model" if step_modes(cfg)["vlm"] != "off" else "") + f"; running 1 on GPU {best})")
+    else:
+        note = ""
+    slots = [g for k in range(AUTO_MAX_PER_GPU) for g in sorted(per) if per[g] > k]  # interleaved over GPUs
+    desc = ", ".join(f"GPU {g}: {per.get(g, 0)} ({free[g]:.0f} GB free)" for g in sorted(free))
+    return slots, f"auto, ~{job:.1f} GB per tracking job -> {desc}{note}"
+
+
 def vlm_device(cfg):
     """'cuda:N' / 'cpu' and why: the selected tracking GPU with the most free memory, if it has room."""
     gpus = cfg["track"].get("gpus") or []
@@ -274,6 +379,7 @@ class VlmCheck:
         self.mode = step_modes(cfg)["vlm"]
         self.model = None
         self.error = None  # set when loading failed: every later demo reports it instead of retrying
+        self.lock = threading.Lock()  # one model, shared by the parallel workers: one call at a time
 
     def load(self):
         import vlm_check
@@ -282,11 +388,14 @@ class VlmCheck:
         self.questions = vlm_check.load_questions(REPO / (v.get("questions") or vlm_check.DEFAULT_QUESTIONS))
         device, self.where = vlm_device(self.cfg)
         print(f"VLM check: loading {v['model']} on {self.where}", flush=True)
-        self.status.data["current"] = f"VLM check: loading {v['model']} on {self.where}"
-        self.status.save()
+        self.status.note(f"VLM check: loading {v['model']} on {self.where}")
         self.model = vlm_check.QwenChecker(v["model"], device)
 
     def __call__(self, demo_dir, out_dir):
+        with self.lock:
+            self.check(demo_dir, out_dir)
+
+    def check(self, demo_dir, out_dir):
         name, status = demo_dir.name, self.status
         video = demo_dir / f"{name}{self.cfg['b_suffix']}.mp4"
         result = out_dir / f"{video.stem}_vlm.json"
@@ -348,13 +457,48 @@ def main():
     if not demos:
         raise SystemExit(f"no demo_* folders under {root}")
     out.mkdir(parents=True, exist_ok=True)
-    status = Status(out / "batch_status.json", [d.name for d in demos])
-    print(f"batch: {len(demos)} demos from {rel(root)} -> {rel(out)}", flush=True)
+    slots, plan = worker_slots(cfg, demos)
+    slots = slots[:len(demos)]  # never more workers than demos (the first slots are spread over the GPUs)
+    workers = len(slots) or 1
+    status = Status(out / "batch_status.json", [d.name for d in demos], workers)
+    status.data["workers_plan"] = plan
+    status.save()
+    print(f"batch: {len(demos)} demos from {rel(root)} -> {rel(out)}, " +
+          (f"{workers} parallel workers: {plan}" if slots else plan), flush=True)
     vlm_check = VlmCheck(cfg, status)
-    for i, d in enumerate(demos, 1):
-        print(f"[{i}/{len(demos)}] {d.name}", flush=True)
-        process(d, out / d.name, cfg, status)
-        vlm_check(d, out / d.name)
+
+    if not slots:
+        for i, d in enumerate(demos, 1):
+            print(f"[{i}/{len(demos)}] {d.name}", flush=True)
+            process(d, out / d.name, cfg, status)
+            vlm_check(d, out / d.name)
+    else:
+        free = queue.Queue()
+        for g in slots:
+            free.put(g)
+        counter = iter(range(1, len(demos) + 1))
+        counter_lock = threading.Lock()
+
+        def one(d):
+            gpu = free.get()  # a free GPU slot (there is always one: as many slots as workers)
+            try:
+                with counter_lock:
+                    i = next(counter)
+                print(f"[{i}/{len(demos)}] {d.name} on GPU {gpu}", flush=True)
+                process(d, out / d.name, cfg, status, gpu)
+                vlm_check(d, out / d.name)
+                print(f"  {d.name} finished", flush=True)
+            except Exception as e:  # noqa: BLE001 - one bad demo must not stop the batch
+                print(f"  {d.name}: error {e!r}", flush=True)
+                with status.lock:
+                    for step, st in status.data["demos"][d.name].items():
+                        if st["status"] in ("pending", "running"):
+                            status.set(d.name, step, "failed", error=repr(e))
+            finally:
+                free.put(gpu)
+
+        with ThreadPoolExecutor(workers) as ex:
+            list(ex.map(one, demos))
     status.data["finished"] = time.time()
     status.data["current"] = None
     status.save()
