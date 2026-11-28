@@ -12,14 +12,23 @@ the model puts on the four answer tokens, on the four leading-space tokens, and 
 
 It asks the questions on the videos of one set, with the same images and the same prompt as the VLM check,
 and writes one row per video and question to outputs/vlm_loop/token_check/NAME.csv:
-    video, label, question, p_yes, p_yes_saved, sum_answer, sum_space, sum_other, top_token, top_prob
+    video, label, question, p_yes, p_yes_saved, p_yes_with_space, sum_answer, sum_space, sum_space_yes,
+    sum_space_no, sum_other, top_token, top_prob
 p_yes is computed here from the four answer tokens. p_yes_saved is the value of --pyes (a pyes CSV of
 score.py, e.g. scripts/vlm_loop/results/vlm_v1.0/franka_pyes_vlm_v1.0.csv); the two must agree. Without
---pyes the column is empty. The summary (min, mean, max of every sum) is printed.
+--pyes the column is empty. p_yes_with_space counts the leading-space tokens too:
+    (P("Yes") + P("yes") + P(" Yes") + P(" yes")) / (the same + P("No") + P("no") + P(" No") + P(" no")).
+sum_space_yes and sum_space_no are the two parts of sum_space. The summary (min, mean, max of every sum) is
+printed.
+
+To score both ways with score.py, two more files are written, in the format of score.py --pyes (one row per
+video: video, then <question id>_p_yes for every question):
+    outputs/vlm_loop/token_check/NAME_pyes.csv             p_yes
+    outputs/vlm_loop/token_check/NAME_pyes_with_space.csv  p_yes_with_space
 
 The videos are read straight from the share folder (as run_batch.py does). With --first_good and --first_bad
 only the first N good and the first M bad videos of the set are used. The frames go to a temporary folder
-that is removed at the end. No other file is written.
+that is removed at the end.
 """
 
 from __future__ import annotations
@@ -38,8 +47,8 @@ from make_set import read_sets, share_demos  # noqa: E402
 
 ANSWER_WORDS = ("Yes", "yes", "No", "no")
 OUT_DIR = REPO / "outputs" / "vlm_loop" / "token_check"
-COLUMNS = ["video", "label", "question", "p_yes", "p_yes_saved", "sum_answer", "sum_space", "sum_other",
-           "top_token", "top_prob"]
+COLUMNS = ["video", "label", "question", "p_yes", "p_yes_saved", "p_yes_with_space", "sum_answer", "sum_space",
+           "sum_space_yes", "sum_space_no", "sum_other", "top_token", "top_prob"]
 
 
 def single_token(tokenizer, word: str) -> int:
@@ -122,11 +131,15 @@ def main():
             for q in questions:
                 probs = first_token_probs(checker, images[q.id], q.text)
                 yes, no = probs[answer_ids[:2]].sum().item(), probs[answer_ids[2:]].sum().item()
-                sum_space = probs[space_ids].sum().item()
+                space_yes, space_no = probs[space_ids[:2]].sum().item(), probs[space_ids[2:]].sum().item()
+                sum_space = space_yes + space_no
                 top_prob, top_id = probs.max(-1)
                 old = saved.get(name, {}).get(f"{q.id}_p_yes", "")
                 out.append({"video": name, "label": r["label"], "question": q.id, "p_yes": yes / (yes + no),
-                            "p_yes_saved": old, "sum_answer": yes + no, "sum_space": sum_space,
+                            "p_yes_saved": old,
+                            "p_yes_with_space": (yes + space_yes) / (yes + no + sum_space),
+                            "sum_answer": yes + no, "sum_space": sum_space,
+                            "sum_space_yes": space_yes, "sum_space_no": space_no,
                             "sum_other": 1 - yes - no - sum_space, "top_token": tok.decode([top_id.item()]),
                             "top_prob": top_prob.item()})
             print(f"{i}/{len(rows)} {name}", flush=True)
@@ -137,12 +150,21 @@ def main():
         w = csv.DictWriter(f, fieldnames=COLUMNS)
         w.writeheader()
         w.writerows(out)
+    for key, suffix in (("p_yes", "_pyes"), ("p_yes_with_space", "_pyes_with_space")):
+        with open(OUT_DIR / f"{args.name}{suffix}.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["video"] + [f"{q.id}_p_yes" for q in questions])
+            for r in rows:
+                values = {o["question"]: o[key] for o in out if o["video"] == r["video"]}
+                w.writerow([r["video"]] + [values[q.id] for q in questions])
 
     print(f"\n{len(out)} answers ({len(rows)} videos x {len(questions)} questions), model {args.model}")
     for key, label in (("sum_answer", "four answer tokens"), ("sum_space", "four leading-space tokens"),
                        ("sum_other", "all other tokens")):
         v = [o[key] for o in out]
         print(f"{label}: min {min(v):.6f}  mean {sum(v) / len(v):.6f}  max {max(v):.6f}")
+    shift = [abs(o["p_yes_with_space"] - o["p_yes"]) for o in out]
+    print(f"abs(p_yes_with_space - p_yes): mean {sum(shift) / len(shift):.2e}  max {max(shift):.2e}")
     compared = [abs(o["p_yes"] - float(o["p_yes_saved"])) for o in out if o["p_yes_saved"] != ""]
     if compared:
         print(f"abs(p_yes - p_yes_saved): max {max(compared):.2e} ({len(compared)} answers)")
